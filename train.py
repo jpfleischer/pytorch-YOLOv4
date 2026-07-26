@@ -129,6 +129,139 @@ def bboxes_iou(bboxes_a, bboxes_b, xyxy=True, GIoU=False, DIoU=False, CIoU=False
     return iou
 
 
+def darknet_dx_box_iou(pred, truth, raw_box, iou_normalizer, iou_loss):
+    """Return Codeberg Darknet's direct YOLO box delta.
+
+    ``pred`` and ``truth`` are centre-x/centre-y/width/height boxes in
+    Darknet's normalized network coordinates.  The result is the *negative*
+    raw-logit gradient written by Darknet's ``delta_yolo_box()``.  This is
+    deliberately not an autograd derivative of a conventional CIoU scalar:
+    Darknet's hand-derived ``dx_box_iou()`` has distinct coordinate scaling
+    and width/height terms, so exact training compatibility requires it.
+    """
+    if iou_loss not in {'iou', 'giou', 'diou', 'ciou'}:
+        raise ValueError(f"Darknet loss mode does not support iou_loss={iou_loss!r}; use --loss-mode legacy.")
+
+    px, py, pw, ph = pred.unbind(dim=1)
+    tx, ty, tw, th = truth.unbind(dim=1)
+    pred_t, pred_b = py - ph / 2, py + ph / 2
+    pred_l, pred_r = px - pw / 2, px + pw / 2
+    truth_t, truth_b = ty - th / 2, ty + th / 2
+    truth_l, truth_r = tx - tw / 2, tx + tw / 2
+
+    # Keep the same min/max branches and intermediate expressions as
+    # Darknet src-lib/box.cpp:dx_box_iou().  Positive predicted sizes make
+    # the min/max orientation normal in YOLO, but preserving it here avoids
+    # changing behaviour for unusual raw outputs.
+    top, bottom = torch.minimum(pred_t, pred_b), torch.maximum(pred_t, pred_b)
+    left, right = torch.minimum(pred_l, pred_r), torch.maximum(pred_l, pred_r)
+    area = (bottom - top) * (right - left)
+    truth_area = (truth_b - truth_t) * (truth_r - truth_l)
+    intersection_h = torch.minimum(bottom, truth_b) - torch.maximum(top, truth_t)
+    intersection_w = torch.minimum(right, truth_r) - torch.maximum(left, truth_l)
+    intersection = intersection_w * intersection_h
+    union = area + truth_area - intersection
+    distance = (px - tx).square() + (py - ty).square()
+    giou_width = torch.maximum(right, truth_r) - torch.minimum(left, truth_l)
+    giou_height = torch.maximum(bottom, truth_b) - torch.minimum(top, truth_t)
+    giou_area = giou_width * giou_height
+
+    darea_t = -(right - left)
+    darea_b = right - left
+    darea_l = -(bottom - top)
+    darea_r = bottom - top
+    dinter_t = torch.where(top > truth_t, -intersection_w, torch.zeros_like(top))
+    dinter_b = torch.where(bottom < truth_b, intersection_w, torch.zeros_like(top))
+    dinter_l = torch.where(left > truth_l, -intersection_h, torch.zeros_like(top))
+    dinter_r = torch.where(right < truth_r, intersection_h, torch.zeros_like(top))
+    dunion_t, dunion_b = darea_t - dinter_t, darea_b - dinter_b
+    dunion_l, dunion_r = darea_l - dinter_l, darea_r - dinter_r
+    dgiou_t = torch.where(top < truth_t, -giou_width, torch.zeros_like(top))
+    dgiou_b = torch.where(bottom > truth_b, giou_width, torch.zeros_like(top))
+    dgiou_l = torch.where(left < truth_l, -giou_height, torch.zeros_like(top))
+    dgiou_r = torch.where(right > truth_r, giou_height, torch.zeros_like(top))
+
+    safe_union_sq = union.square().clamp_min(1e-30)
+    valid_union = union > 0
+    def iou_part(dinter, dunion):
+        value = (union * dinter - intersection * dunion) / safe_union_sq
+        return torch.where(valid_union, value, torch.zeros_like(value))
+
+    p_t, p_b = iou_part(dinter_t, dunion_t), iou_part(dinter_b, dunion_b)
+    p_l, p_r = iou_part(dinter_l, dunion_l), iou_part(dinter_r, dunion_r)
+    normal_height = pred_t < pred_b
+    normal_width = pred_l < pred_r
+    p_t = torch.where(normal_height, p_t, p_b)
+    p_b = torch.where(normal_height, p_b, p_t)
+    p_l = torch.where(normal_width, p_l, p_r)
+    p_r = torch.where(normal_width, p_r, p_l)
+
+    enclosure_t = torch.minimum(py - ph / 2, ty - th / 2)
+    enclosure_b = torch.maximum(py + ph / 2, ty + th / 2)
+    enclosure_l = torch.minimum(px - pw / 2, tx - tw / 2)
+    enclosure_r = torch.maximum(px + pw / 2, tx + tw / 2)
+    enclosure_w, enclosure_h = enclosure_r - enclosure_l, enclosure_b - enclosure_t
+    enclosure_diag = enclosure_w.square() + enclosure_h.square()
+    dct_dy = torch.where(top < truth_t, torch.ones_like(top), torch.zeros_like(top))
+    dct_dh = torch.where(top < truth_t, torch.full_like(top, -0.5), torch.zeros_like(top))
+    dcb_dy = torch.where(bottom > truth_b, torch.ones_like(top), torch.zeros_like(top))
+    dcb_dh = torch.where(bottom > truth_b, torch.full_like(top, 0.5), torch.zeros_like(top))
+    dcl_dx = torch.where(left < truth_l, torch.ones_like(top), torch.zeros_like(top))
+    dcl_dw = torch.where(left < truth_l, torch.full_like(top, -0.5), torch.zeros_like(top))
+    dcr_dx = torch.where(right > truth_r, torch.ones_like(top), torch.zeros_like(top))
+    dcr_dw = torch.where(right > truth_r, torch.full_like(top, 0.5), torch.zeros_like(top))
+    dcw_dx, dcw_dy, dcw_dw, dcw_dh = dcr_dx - dcl_dx, torch.zeros_like(top), dcr_dw - dcl_dw, torch.zeros_like(top)
+    dch_dx, dch_dy, dch_dw, dch_dh = torch.zeros_like(top), dcb_dy - dct_dy, torch.zeros_like(top), dcb_dh - dct_dh
+
+    p_dx, p_dy = p_l + p_r, p_t + p_b
+    # This intentionally follows Darknet's (non-half) width/height terms.
+    p_dw, p_dh = p_r - p_l, p_b - p_t
+    safe_enclosure_sq = enclosure_diag.square().clamp_min(1e-30)
+    valid_enclosure = enclosure_diag > 0
+    def distance_term(dx, dy, dw, dh):
+        dc = 2 * enclosure_w * dx + 2 * enclosure_h * dy
+        return (2 * (tx - px) * enclosure_diag - dc * distance) / safe_enclosure_sq, \
+            (2 * (ty - py) * enclosure_diag - dc * distance) / safe_enclosure_sq, \
+            (2 * enclosure_w * dw + 2 * enclosure_h * dh) * distance / safe_enclosure_sq
+
+    diou_dx, _, diou_dw = distance_term(dcw_dx, dch_dx, dcw_dw, dch_dw)
+    _, diou_dy, diou_dh = distance_term(dcw_dy, dch_dy, dcw_dh, dch_dh)
+    no_overlap = (intersection_w <= 0) | (intersection_h <= 0)
+    if iou_loss == 'giou':
+        safe_giou_sq = giou_area.square().clamp_min(1e-30)
+        def giou_part(dunion, dgiou):
+            return (giou_area * dunion - union * dgiou) / safe_giou_sq
+        g_t, g_b = giou_part(dunion_t, dgiou_t), giou_part(dunion_b, dgiou_b)
+        g_l, g_r = giou_part(dunion_l, dgiou_l), giou_part(dunion_r, dgiou_r)
+        p_t, p_b = p_t + g_t, p_b + g_b
+        p_l, p_r = p_l + g_l, p_r + g_r
+        p_t, p_b = torch.where(no_overlap, g_t, p_t), torch.where(no_overlap, g_b, p_b)
+        p_l, p_r = torch.where(no_overlap, g_l, p_l), torch.where(no_overlap, g_r, p_r)
+        p_dx, p_dy, p_dw, p_dh = p_l + p_r, p_t + p_b, p_r - p_l, p_b - p_t
+    elif iou_loss in {'diou', 'ciou'}:
+        diou_dx, diou_dy, diou_dw, diou_dh = (
+            torch.where(valid_enclosure, diou_dx, torch.zeros_like(diou_dx)),
+            torch.where(valid_enclosure, diou_dy, torch.zeros_like(diou_dy)),
+            torch.where(valid_enclosure, diou_dw, torch.zeros_like(diou_dw)),
+            torch.where(valid_enclosure, diou_dh, torch.zeros_like(diou_dh)),
+        )
+        if iou_loss == 'ciou':
+            aspect = 4 / (math.pi * math.pi) * (torch.atan(tw / th) - torch.atan(pw / ph)).square()
+            alpha = aspect / (1 - intersection / union + aspect + 1e-6)
+            aspect_dw = 8 / (math.pi * math.pi) * (torch.atan(tw / th) - torch.atan(pw / ph)) * ph
+            aspect_dh = -8 / (math.pi * math.pi) * (torch.atan(tw / th) - torch.atan(pw / ph)) * pw
+            diou_dw = diou_dw + alpha * aspect_dw
+            diou_dh = diou_dh + alpha * aspect_dh
+        p_dx, p_dy, p_dw, p_dh = p_dx + diou_dx, p_dy + diou_dy, p_dw + diou_dw, p_dh + diou_dh
+        p_dx, p_dy = torch.where(no_overlap, diou_dx, p_dx), torch.where(no_overlap, diou_dy, p_dy)
+        p_dw, p_dh = torch.where(no_overlap, diou_dw, p_dw), torch.where(no_overlap, diou_dh, p_dh)
+
+    # Darknet applies exp() only to its width/height raw-logit deltas; x/y
+    # intentionally bypass sigmoid/scale_x_y derivatives.
+    delta = torch.stack((p_dx, p_dy, p_dw * torch.exp(raw_box[:, 2]), p_dh * torch.exp(raw_box[:, 3])), dim=1)
+    return delta * iou_normalizer
+
+
 class Yolo_loss(nn.Module):
     """YOLO loss derived from the selected Darknet cfg.
 
@@ -269,6 +402,7 @@ class Yolo_loss(nn.Module):
 
             output = output.view(batchsize, n_anchors, n_ch, grid_h, grid_w)
             output = output.permute(0, 1, 3, 4, 2)  # .contiguous()
+            box_logits = output[..., :4]
 
             # Keep the logits for objectness/classification loss.  Applying
             # sigmoid first and feeding the result to BCELoss can underflow to
@@ -312,8 +446,8 @@ class Yolo_loss(nn.Module):
                         cls_logits[positive_cls], target[..., 5:][positive_cls], reduction='sum',
                     )
 
-                    # The cfg's CIoU/DIoU/GIoU setting is applied to decoded
-                    # boxes, exactly as Darknet's delta_yolo_box() does.
+                    # Decode a conventional quality value for logging, then
+                    # inject Darknet's exact hand-written box gradient below.
                     grid = torch.stack((x, y), dim=-1).view(1, 1, grid_h, grid_w, 2)
                     grid = grid.expand(batchsize, n_anchors, -1, -1, -1)[positive_cls]
                     positive_anchors = anchors.view(1, n_anchors, 1, 1, 2).expand(
@@ -338,9 +472,22 @@ class Yolo_loss(nn.Module):
                         quality = bboxes_iou(pred_box, target_box, xyxy=False).diagonal()
                     else:
                         raise ValueError(f"Darknet loss mode does not support iou_loss={kind!r}; use --loss-mode legacy.")
-                    # ``loss_xy`` remains the historical return slot used by
-                    # the logger; in Darknet mode it contains the full box loss.
-                    loss_xy += spec['iou_normalizer'] * (1 - quality).sum()
+                    reported_box_loss = spec['iou_normalizer'] * (1 - quality).sum()
+                    normalized_scale = pred_box.new_tensor((grid_w, grid_h, grid_w, grid_h))
+                    with torch.no_grad():
+                        darknet_delta = darknet_dx_box_iou(
+                            pred_box / normalized_scale,
+                            target_box / normalized_scale,
+                            box_logits[positive_cls],
+                            spec['iou_normalizer'],
+                            kind,
+                        )
+                    # Darknet's layer.delta is the negative gradient passed
+                    # directly into the preceding convolution.  Preserve the
+                    # useful scalar loss for logs while replacing only its
+                    # derivative with that exact delta.
+                    direct_gradient = (-darknet_delta.detach() * box_logits[positive_cls]).sum()
+                    loss_xy += reported_box_loss.detach() + direct_gradient - direct_gradient.detach()
             else:
                 # Kept for reproducing prior fork experiments.  This is not
                 # equivalent to a cfg with ``iou_loss=ciou``.
