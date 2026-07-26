@@ -364,9 +364,9 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         elif i < config.steps[0]:
             factor = 1.0
         elif i < config.steps[1]:
-            factor = 0.1
+            factor = config.scales[0]
         else:
-            factor = 0.01
+            factor = config.scales[0] * config.scales[1]
         return factor
 
     if config.TRAIN_OPTIMIZER.lower() == 'adam':
@@ -608,6 +608,12 @@ def get_args(**kwargs):
     parser.add_argument('--epochs', dest='TRAIN_EPOCHS', type=int, default=Cfg.TRAIN_EPOCHS)
     parser.add_argument('--batch', type=int, default=Cfg.batch, help='effective batch size')
     parser.add_argument('--subdivisions', type=int, default=Cfg.subdivisions, help='gradient-accumulation subdivisions')
+    parser.add_argument('--burn-in', dest='burn_in', type=int, default=Cfg.burn_in,
+                        help='optimizer updates used for fourth-power warmup')
+    parser.add_argument('--steps', type=int, nargs=2, default=Cfg.steps, metavar=('STEP1', 'STEP2'),
+                        help='optimizer-update milestones for learning-rate decay')
+    parser.add_argument('--scales', type=float, nargs=2, default=Cfg.scales, metavar=('SCALE1', 'SCALE2'),
+                        help='learning-rate multipliers at the two milestones')
     parser.add_argument('--workers', type=int, default=4, help='data-loader worker processes')
     parser.add_argument('--seed', type=int, default=0, help='random seed for split-independent reproducibility')
     parser.add_argument('--mosaic', type=int, choices=[0, 1], default=Cfg.mosaic)
@@ -644,6 +650,12 @@ def get_args(**kwargs):
     cfg['h'] = cfg['height']
     if cfg['width'] % 32 or cfg['height'] % 32:
         parser.error('--width and --height must each be divisible by 32')
+    if cfg['burn_in'] < 0:
+        parser.error('--burn-in must be non-negative')
+    if cfg['steps'][0] <= cfg['burn_in'] or cfg['steps'][1] <= cfg['steps'][0]:
+        parser.error('--steps must satisfy burn-in < STEP1 < STEP2')
+    if any(scale <= 0 for scale in cfg['scales']):
+        parser.error('--scales must be positive')
     if not cfg['use_darknet_cfg']:
         parser.error('Only --use-darknet-cfg training is supported by the cfg-derived loss.')
     if cfg['letter_box'] and cfg['mosaic']:
