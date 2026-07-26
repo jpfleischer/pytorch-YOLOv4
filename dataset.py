@@ -13,6 +13,7 @@
 import os
 import random
 import sys
+import zlib
 
 import cv2
 import numpy as np
@@ -115,7 +116,7 @@ def image_data_augmentation(mat, w, h, pleft, ptop, swidth, sheight, flip, dhue,
                     max(0, -ptop) + new_src_rect[3] - new_src_rect[1]]
         # cv2.Mat sized
 
-        if (src_rect[0] == 0 and src_rect[1] == 0 and src_rect[2] == img.shape[0] and src_rect[3] == img.shape[1]):
+        if src_rect == [0, 0, ow, oh]:
             sized = cv2.resize(img, (w, h), cv2.INTER_LINEAR)
         else:
             cropped = np.zeros([sheight, swidth, 3])
@@ -137,7 +138,7 @@ def image_data_augmentation(mat, w, h, pleft, ptop, swidth, sheight, flip, dhue,
         if dsat != 1 or dexp != 1 or dhue != 0:
             if img.shape[2] >= 3:
                 hsv_src = cv2.cvtColor(sized.astype(np.float32), cv2.COLOR_RGB2HSV)  # RGB to HSV
-                hsv = cv2.split(hsv_src)
+                hsv = list(cv2.split(hsv_src))
                 hsv[1] *= dsat
                 hsv[2] *= dexp
                 hsv[0] += 179 * dhue
@@ -174,9 +175,8 @@ def image_data_augmentation(mat, w, h, pleft, ptop, swidth, sheight, flip, dhue,
             gaussian_noise = max(gaussian_noise, 0)
             cv2.randn(noise, 0, gaussian_noise)  # mean and variance
             sized = sized + noise
-    except:
-        print("OpenCV can't augment image: " + str(w) + " x " + str(h))
-        sized = mat
+    except Exception as exc:
+        raise RuntimeError(f"OpenCV augmentation failed for {w}x{h}") from exc
 
     return sized
 
@@ -244,18 +244,21 @@ class Yolo_dataset(Dataset):
         super(Yolo_dataset, self).__init__()
         if cfg.mixup == 2:
             print("cutmix=1 - isn't supported for Detector")
-            raise
-        elif cfg.mixup == 2 and cfg.letter_box:
+            raise ValueError("cutmix is not supported")
+        elif cfg.mixup == 3 and cfg.letter_box:
             print("Combination: letter_box=1 & mosaic=1 - isn't supported, use only 1 of these parameters")
-            raise
+            raise ValueError("mosaic and letter_box cannot be enabled together")
 
         self.cfg = cfg
         self.train = train
 
         truth = {}
-        f = open(label_path, 'r', encoding='utf-8')
-        for line in f.readlines():
-            data = line.split(" ")
+        with open(label_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        for line in lines:
+            data = line.split()
+            if not data:
+                continue
             truth[data[0]] = []
             for i in data[1:]:
                 truth[data[0]].append([int(float(j)) for j in i.split(',')])
@@ -270,7 +273,7 @@ class Yolo_dataset(Dataset):
         if not self.train:
             return self._get_val_item(index)
         img_path = self.imgs[index]
-        bboxes = np.array(self.truth.get(img_path), dtype=np.float)
+        bboxes = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
         img_path = os.path.join(self.cfg.dataset_dir, img_path)
         use_mixup = self.cfg.mixup
         if random.randint(0, 1):
@@ -291,14 +294,14 @@ class Yolo_dataset(Dataset):
         for i in range(use_mixup + 1):
             if i != 0:
                 img_path = random.choice(list(self.truth.keys()))
-                bboxes = np.array(self.truth.get(img_path), dtype=np.float)
+                bboxes = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
                 img_path = os.path.join(self.cfg.dataset_dir, img_path)
             img = cv2.imread(img_path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             if img is None:
-                continue
+                raise FileNotFoundError(f"Unable to read training image: {img_path}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             oh, ow, oc = img.shape
-            dh, dw, dc = np.array(np.array([oh, ow, oc]) * self.cfg.jitter, dtype=np.int)
+            dh, dw, dc = np.array(np.array([oh, ow, oc]) * self.cfg.jitter, dtype=np.int32)
 
             dhue = rand_uniform_strong(-self.cfg.hue, self.cfg.hue)
             dsat = rand_scale(self.cfg.saturation)
@@ -390,7 +393,7 @@ class Yolo_dataset(Dataset):
         """
         """
         img_path = self.imgs[index]
-        bboxes_with_cls_id = np.array(self.truth.get(img_path), dtype=np.float)
+        bboxes_with_cls_id = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
         img = cv2.imread(os.path.join(self.cfg.dataset_dir, img_path))
         # img_height, img_width = img.shape[:2]
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -429,12 +432,13 @@ def get_image_id(filename:str) -> int:
     # no = f"{int(no):04d}"
     # return int(lv+no)
 
-    print("You could also create your own 'get_image_id' function.")
-    # print(filename)
-    parts = filename.split('/')
-    id = int(parts[-1][0:-4])
-    # print(id)
-    return id
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    try:
+        return int(stem)
+    except ValueError:
+        # COCO requires an integer ID; a deterministic hash supports ordinary
+        # filenames without relying on a dataset-specific naming convention.
+        return zlib.crc32(filename.encode('utf-8')) & 0x7fffffff
 
 
 if __name__ == "__main__":

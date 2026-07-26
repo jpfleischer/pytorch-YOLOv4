@@ -124,12 +124,16 @@ class EmptyModule(nn.Module):
 
 # support route shortcut and reorg
 class Darknet(nn.Module):
-    def __init__(self, cfgfile, inference=False):
+    def __init__(self, cfgfile, inference=False, width=None, height=None):
         super(Darknet, self).__init__()
         self.inference = inference
         self.training = not self.inference
 
         self.blocks = parse_cfg(cfgfile)
+        if width is not None:
+            self.blocks[0]['width'] = str(width)
+        if height is not None:
+            self.blocks[0]['height'] = str(height)
         self.width = int(self.blocks[0]['width'])
         self.height = int(self.blocks[0]['height'])
 
@@ -160,11 +164,14 @@ class Darknet(nn.Module):
             elif block['type'] in ['convolutional', 'maxpool', 'reorg', 'upsample', 'avgpool', 'softmax', 'connected']:
                 x = self.models[ind](x)
                 outputs[ind] = x
-            elif block['type'] == 'route':
+            elif block['type'] in ['route', 'route_lhalf']:
                 layers = block['layers'].split(',')
                 layers = [int(i) if int(i) > 0 else int(i) + ind for i in layers]
                 if len(layers) == 1:
-                    if 'groups' not in block.keys() or int(block['groups']) == 1:
+                    if block['type'] == 'route_lhalf':
+                        x = outputs[layers[0]][:, :outputs[layers[0]].shape[1] // 2]
+                        outputs[ind] = x
+                    elif 'groups' not in block.keys() or int(block['groups']) == 1:
                         x = outputs[layers[0]]
                         outputs[ind] = x
                     else:
@@ -335,12 +342,15 @@ class Darknet(nn.Module):
                 models.append(Upsample_expand(stride))
                 # models.append(Upsample_interpolate(stride))
 
-            elif block['type'] == 'route':
+            elif block['type'] in ['route', 'route_lhalf']:
                 layers = block['layers'].split(',')
                 ind = len(models)
                 layers = [int(i) if int(i) > 0 else int(i) + ind for i in layers]
                 if len(layers) == 1:
-                    if 'groups' not in block.keys() or int(block['groups']) == 1:
+                    if block['type'] == 'route_lhalf':
+                        prev_filters = out_filters[layers[0]] // 2
+                        prev_stride = out_strides[layers[0]]
+                    elif 'groups' not in block.keys() or int(block['groups']) == 1:
                         prev_filters = out_filters[layers[0]]
                         prev_stride = out_strides[layers[0]]
                     else:
@@ -464,7 +474,7 @@ class Darknet(nn.Module):
                 pass
             elif block['type'] == 'upsample':
                 pass
-            elif block['type'] == 'route':
+            elif block['type'] in ['route', 'route_lhalf']:
                 pass
             elif block['type'] == 'shortcut':
                 pass

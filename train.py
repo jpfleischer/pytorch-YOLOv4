@@ -16,6 +16,7 @@ import os, sys, math
 import argparse
 from collections import deque
 import datetime
+import random
 
 import cv2
 from tqdm import tqdm
@@ -32,6 +33,7 @@ from dataset import Yolo_dataset
 from cfg import Cfg
 from models import Yolov4
 from tool.darknet2pytorch import Darknet
+from tool.utils import nms_cpu
 
 from tool.tv_reference.utils import collate_fn as val_collate
 from tool.tv_reference.coco_utils import convert_to_coco_api
@@ -128,58 +130,56 @@ def bboxes_iou(bboxes_a, bboxes_b, xyxy=True, GIoU=False, DIoU=False, CIoU=False
 
 
 class Yolo_loss(nn.Module):
-    def __init__(self, n_classes=80, n_anchors=3, device=None, batch=2):
-        super(Yolo_loss, self).__init__()
+    """YOLO loss derived from the selected Darknet cfg.
+
+    The original implementation baked in three 608x608 YOLOv4 heads.  Building
+    the tensors from each output fixes rectangular inputs and YOLOv4-tiny's two
+    detection heads.
+    """
+    def __init__(self, output_specs, n_classes, device=None):
+        super().__init__()
         self.device = device
-        self.strides = [8, 16, 32]
-        image_size = 608
         self.n_classes = n_classes
-        self.n_anchors = n_anchors
-
-        self.anchors = [[12, 16], [19, 36], [40, 28], [36, 75], [76, 55], [72, 146], [142, 110], [192, 243], [459, 401]]
-        self.anch_masks = [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
         self.ignore_thre = 0.5
+        self.output_specs = output_specs
 
-        self.masked_anchors, self.ref_anchors, self.grid_x, self.grid_y, self.anchor_w, self.anchor_h = [], [], [], [], [], []
+    @classmethod
+    def from_darknet(cls, model, n_classes, device=None):
+        specs = []
+        for block, layer in zip(model.blocks[1:], model.models):
+            if block['type'] == 'yolo':
+                anchors = np.asarray(layer.anchors, dtype=np.float32).reshape(-1, 2)
+                specs.append({
+                    'stride': int(layer.stride),
+                    'anchors': anchors,
+                    'mask': list(layer.anchor_mask),
+                    'scale_x_y': float(layer.scale_x_y),
+                })
+        if not specs:
+            raise ValueError('The selected cfg contains no [yolo] detection layers.')
+        return cls(specs, n_classes=n_classes, device=device)
 
-        for i in range(3):
-            all_anchors_grid = [(w / self.strides[i], h / self.strides[i]) for w, h in self.anchors]
-            masked_anchors = np.array([all_anchors_grid[j] for j in self.anch_masks[i]], dtype=np.float32)
-            ref_anchors = np.zeros((len(all_anchors_grid), 4), dtype=np.float32)
-            ref_anchors[:, 2:] = np.array(all_anchors_grid, dtype=np.float32)
-            ref_anchors = torch.from_numpy(ref_anchors)
-            # calculate pred - xywh obj cls
-            fsize = image_size // self.strides[i]
-            grid_x = torch.arange(fsize, dtype=torch.float).repeat(batch, 3, fsize, 1).to(device)
-            grid_y = torch.arange(fsize, dtype=torch.float).repeat(batch, 3, fsize, 1).permute(0, 1, 3, 2).to(device)
-            anchor_w = torch.from_numpy(masked_anchors[:, 0]).repeat(batch, fsize, fsize, 1).permute(0, 3, 1, 2).to(
-                device)
-            anchor_h = torch.from_numpy(masked_anchors[:, 1]).repeat(batch, fsize, fsize, 1).permute(0, 3, 1, 2).to(
-                device)
-
-            self.masked_anchors.append(masked_anchors)
-            self.ref_anchors.append(ref_anchors)
-            self.grid_x.append(grid_x)
-            self.grid_y.append(grid_y)
-            self.anchor_w.append(anchor_w)
-            self.anchor_h.append(anchor_h)
-
-    def build_target(self, pred, labels, batchsize, fsize, n_ch, output_id):
+    def build_target(self, pred, labels, batchsize, grid_h, grid_w, n_ch, output_id):
         # target assignment
-        tgt_mask = torch.zeros(batchsize, self.n_anchors, fsize, fsize, 4 + self.n_classes).to(device=self.device)
-        obj_mask = torch.ones(batchsize, self.n_anchors, fsize, fsize).to(device=self.device)
-        tgt_scale = torch.zeros(batchsize, self.n_anchors, fsize, fsize, 2).to(self.device)
-        target = torch.zeros(batchsize, self.n_anchors, fsize, fsize, n_ch).to(self.device)
+        spec = self.output_specs[output_id]
+        stride = spec['stride']
+        all_anchors = torch.as_tensor(spec['anchors'] / stride, device=self.device)
+        masked_anchors = all_anchors[spec['mask']]
+        n_anchors = len(spec['mask'])
+        tgt_mask = torch.zeros(batchsize, n_anchors, grid_h, grid_w, 4 + self.n_classes, device=self.device)
+        obj_mask = torch.ones(batchsize, n_anchors, grid_h, grid_w, device=self.device)
+        tgt_scale = torch.zeros(batchsize, n_anchors, grid_h, grid_w, 2, device=self.device)
+        target = torch.zeros(batchsize, n_anchors, grid_h, grid_w, n_ch, device=self.device)
 
         # labels = labels.cpu().data
         nlabel = (labels.sum(dim=2) > 0).sum(dim=1)  # number of objects
 
-        truth_x_all = (labels[:, :, 2] + labels[:, :, 0]) / (self.strides[output_id] * 2)
-        truth_y_all = (labels[:, :, 3] + labels[:, :, 1]) / (self.strides[output_id] * 2)
-        truth_w_all = (labels[:, :, 2] - labels[:, :, 0]) / self.strides[output_id]
-        truth_h_all = (labels[:, :, 3] - labels[:, :, 1]) / self.strides[output_id]
-        truth_i_all = truth_x_all.to(torch.int16).cpu().numpy()
-        truth_j_all = truth_y_all.to(torch.int16).cpu().numpy()
+        truth_x_all = (labels[:, :, 2] + labels[:, :, 0]) / (stride * 2)
+        truth_y_all = (labels[:, :, 3] + labels[:, :, 1]) / (stride * 2)
+        truth_w_all = (labels[:, :, 2] - labels[:, :, 0]) / stride
+        truth_h_all = (labels[:, :, 3] - labels[:, :, 1]) / stride
+        truth_i_all = truth_x_all.to(torch.long).clamp_(0, grid_w - 1).cpu().numpy()
+        truth_j_all = truth_y_all.to(torch.long).clamp_(0, grid_h - 1).cpu().numpy()
 
         for b in range(batchsize):
             n = int(nlabel[b])
@@ -191,16 +191,16 @@ class Yolo_loss(nn.Module):
             truth_i = truth_i_all[b, :n]
             truth_j = truth_j_all[b, :n]
 
-            # calculate iou between truth and reference anchors
-            anchor_ious_all = bboxes_iou(truth_box.cpu(), self.ref_anchors[output_id], CIoU=True)
-
-            # temp = bbox_iou(truth_box.cpu(), self.ref_anchors[output_id])
-
-            best_n_all = anchor_ious_all.argmax(dim=1)
-            best_n = best_n_all % 3
-            best_n_mask = ((best_n_all == self.anch_masks[output_id][0]) |
-                           (best_n_all == self.anch_masks[output_id][1]) |
-                           (best_n_all == self.anch_masks[output_id][2]))
+            # Match on width/height IoU.  Detection-anchor assignment has no
+            # meaningful centre coordinates, so CIoU here is incorrect.
+            truth_wh = truth_box[:, 2:]
+            inter = torch.minimum(truth_wh[:, None], all_anchors[None]).prod(dim=2)
+            union = truth_wh.prod(dim=1, keepdim=True) + all_anchors.prod(dim=1) - inter
+            best_n_all = (inter / (union + 1e-16)).argmax(dim=1)
+            mask_to_output = {anchor_id: index for index, anchor_id in enumerate(spec['mask'])}
+            best_n_mask = torch.tensor(
+                [int(anchor) in mask_to_output for anchor in best_n_all.tolist()], device=self.device, dtype=torch.bool
+            )
 
             if sum(best_n_mask) == 0:
                 continue
@@ -208,50 +208,63 @@ class Yolo_loss(nn.Module):
             truth_box[:n, 0] = truth_x_all[b, :n]
             truth_box[:n, 1] = truth_y_all[b, :n]
 
-            pred_ious = bboxes_iou(pred[b].view(-1, 4), truth_box, xyxy=False)
+            pred_ious = bboxes_iou(pred[b].reshape(-1, 4), truth_box, xyxy=False)
             pred_best_iou, _ = pred_ious.max(dim=1)
             pred_best_iou = (pred_best_iou > self.ignore_thre)
             pred_best_iou = pred_best_iou.view(pred[b].shape[:3])
             # set mask to zero (ignore) if pred matches truth
             obj_mask[b] = ~ pred_best_iou
 
-            for ti in range(best_n.shape[0]):
+            for ti in range(best_n_all.shape[0]):
                 if best_n_mask[ti] == 1:
                     i, j = truth_i[ti], truth_j[ti]
-                    a = best_n[ti]
+                    a = mask_to_output[int(best_n_all[ti])]
                     obj_mask[b, a, j, i] = 1
                     tgt_mask[b, a, j, i, :] = 1
-                    target[b, a, j, i, 0] = truth_x_all[b, ti] - truth_x_all[b, ti].to(torch.int16).to(torch.float)
-                    target[b, a, j, i, 1] = truth_y_all[b, ti] - truth_y_all[b, ti].to(torch.int16).to(torch.float)
-                    target[b, a, j, i, 2] = torch.log(
-                        truth_w_all[b, ti] / torch.Tensor(self.masked_anchors[output_id])[best_n[ti], 0] + 1e-16)
-                    target[b, a, j, i, 3] = torch.log(
-                        truth_h_all[b, ti] / torch.Tensor(self.masked_anchors[output_id])[best_n[ti], 1] + 1e-16)
+                    scale_x_y = spec['scale_x_y']
+                    target[b, a, j, i, 0] = (
+                        truth_x_all[b, ti] - torch.floor(truth_x_all[b, ti]) + 0.5 * (scale_x_y - 1)
+                    ) / scale_x_y
+                    target[b, a, j, i, 1] = (
+                        truth_y_all[b, ti] - torch.floor(truth_y_all[b, ti]) + 0.5 * (scale_x_y - 1)
+                    ) / scale_x_y
+                    target[b, a, j, i, 2] = torch.log(truth_w_all[b, ti] / masked_anchors[a, 0] + 1e-16)
+                    target[b, a, j, i, 3] = torch.log(truth_h_all[b, ti] / masked_anchors[a, 1] + 1e-16)
                     target[b, a, j, i, 4] = 1
                     target[b, a, j, i, 5 + labels[b, ti, 4].to(torch.int16).cpu().numpy()] = 1
-                    tgt_scale[b, a, j, i, :] = torch.sqrt(2 - truth_w_all[b, ti] * truth_h_all[b, ti] / fsize / fsize)
+                    tgt_scale[b, a, j, i, :] = torch.sqrt(2 - truth_w_all[b, ti] * truth_h_all[b, ti] / (grid_w * grid_h))
         return obj_mask, tgt_mask, tgt_scale, target
 
     def forward(self, xin, labels=None):
         loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = 0, 0, 0, 0, 0, 0
         for output_id, output in enumerate(xin):
             batchsize = output.shape[0]
-            fsize = output.shape[2]
+            grid_h, grid_w = output.shape[2:]
             n_ch = 5 + self.n_classes
+            n_anchors = len(self.output_specs[output_id]['mask'])
+            expected_channels = n_anchors * n_ch
+            if output.shape[1] != expected_channels:
+                raise ValueError(
+                    f'YOLO head {output_id} has {output.shape[1]} channels, expected {expected_channels}. '
+                    'Update each detection convolution filters value to anchors * (classes + 5).'
+                )
 
-            output = output.view(batchsize, self.n_anchors, n_ch, fsize, fsize)
+            output = output.view(batchsize, n_anchors, n_ch, grid_h, grid_w)
             output = output.permute(0, 1, 3, 4, 2)  # .contiguous()
 
             # logistic activation for xy, obj, cls
             output[..., np.r_[:2, 4:n_ch]] = torch.sigmoid(output[..., np.r_[:2, 4:n_ch]])
 
             pred = output[..., :4].clone()
-            pred[..., 0] += self.grid_x[output_id]
-            pred[..., 1] += self.grid_y[output_id]
-            pred[..., 2] = torch.exp(pred[..., 2]) * self.anchor_w[output_id]
-            pred[..., 3] = torch.exp(pred[..., 3]) * self.anchor_h[output_id]
+            y, x = torch.meshgrid(torch.arange(grid_h, device=output.device), torch.arange(grid_w, device=output.device), indexing='ij')
+            anchors = torch.as_tensor(self.output_specs[output_id]['anchors'], device=output.device).view(-1, 2)[self.output_specs[output_id]['mask']] / self.output_specs[output_id]['stride']
+            scale_x_y = self.output_specs[output_id]['scale_x_y']
+            pred[..., 0] = pred[..., 0] * scale_x_y - 0.5 * (scale_x_y - 1) + x
+            pred[..., 1] = pred[..., 1] * scale_x_y - 0.5 * (scale_x_y - 1) + y
+            pred[..., 2] = torch.exp(pred[..., 2]) * anchors[:, 0].view(1, -1, 1, 1)
+            pred[..., 3] = torch.exp(pred[..., 3]) * anchors[:, 1].view(1, -1, 1, 1)
 
-            obj_mask, tgt_mask, tgt_scale, target = self.build_target(pred, labels, batchsize, fsize, n_ch, output_id)
+            obj_mask, tgt_mask, tgt_scale, target = self.build_target(pred, labels, batchsize, grid_h, grid_w, n_ch, output_id)
 
             # loss calculation
             output[..., 4] *= obj_mask
@@ -288,18 +301,35 @@ def collate(batch):
     return images, bboxes
 
 
-def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5):
+def _seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5,
+          resume_checkpoint=None):
     train_dataset = Yolo_dataset(config.train_label, config, train=True)
     val_dataset = Yolo_dataset(config.val_label, config, train=False)
 
     n_train = len(train_dataset)
     n_val = len(val_dataset)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch // config.subdivisions, shuffle=True,
-                              num_workers=8, pin_memory=True, drop_last=True, collate_fn=collate)
+    micro_batch = config.batch // config.subdivisions
+    if micro_batch < 1:
+        raise ValueError('batch must be greater than or equal to subdivisions')
+    generator = torch.Generator().manual_seed(config.seed)
+    worker_init_fn = lambda worker_id: _seed_everything(config.seed + worker_id)
+    train_loader = DataLoader(train_dataset, batch_size=micro_batch, shuffle=True,
+                              num_workers=config.workers, pin_memory=device.type == 'cuda', drop_last=True,
+                              collate_fn=collate, generator=generator, worker_init_fn=worker_init_fn)
 
-    val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, num_workers=8,
-                            pin_memory=True, drop_last=True, collate_fn=val_collate)
+    val_loader = DataLoader(val_dataset, batch_size=micro_batch, shuffle=False, num_workers=config.workers,
+                            pin_memory=device.type == 'cuda', drop_last=False, collate_fn=val_collate,
+                            worker_init_fn=worker_init_fn)
 
     writer = SummaryWriter(log_dir=config.TRAIN_TENSORBOARD_DIR,
                            filename_suffix=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}',
@@ -310,6 +340,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     max_itr = config.TRAIN_EPOCHS * n_train
     # global_step = cfg.TRAIN_MINEPOCH * n_train
     global_step = 0
+    start_epoch = 0
     logging.info(f'''Starting training:
         Epochs:          {epochs}
         Batch size:      {config.batch}
@@ -353,15 +384,22 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
             weight_decay=config.decay,
         )
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, burnin_schedule)
+    if resume_checkpoint and 'optimizer' in resume_checkpoint:
+        optimizer.load_state_dict(resume_checkpoint['optimizer'])
+        scheduler.load_state_dict(resume_checkpoint['scheduler'])
+        start_epoch = int(resume_checkpoint['epoch'])
+        global_step = int(resume_checkpoint.get('global_step', 0))
+        logging.info(f'Resuming from epoch {start_epoch + 1}')
 
-    criterion = Yolo_loss(device=device, batch=config.batch // config.subdivisions, n_classes=config.classes)
+    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    criterion = Yolo_loss.from_darknet(base_model, n_classes=config.classes, device=device)
     # scheduler = ReduceLROnPlateau(optimizer, mode='max', verbose=True, patience=6, min_lr=1e-7)
     # scheduler = CosineAnnealingWarmRestarts(optimizer, 0.001, 1e-6, 20)
 
     save_prefix = 'Yolov4_epoch'
     saved_models = deque()
     model.train()
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         # model.train()
         epoch_loss = 0
         epoch_step = 0
@@ -395,33 +433,39 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                     writer.add_scalar('train/loss_obj', loss_obj.item(), global_step)
                     writer.add_scalar('train/loss_cls', loss_cls.item(), global_step)
                     writer.add_scalar('train/loss_l2', loss_l2.item(), global_step)
-                    writer.add_scalar('lr', scheduler.get_lr()[0] * config.batch, global_step)
+                    writer.add_scalar('lr', scheduler.get_last_lr()[0] * config.batch, global_step)
                     pbar.set_postfix(**{'loss (batch)': loss.item(), 'loss_xy': loss_xy.item(),
                                         'loss_wh': loss_wh.item(),
                                         'loss_obj': loss_obj.item(),
                                         'loss_cls': loss_cls.item(),
                                         'loss_l2': loss_l2.item(),
-                                        'lr': scheduler.get_lr()[0] * config.batch
+                                        'lr': scheduler.get_last_lr()[0] * config.batch
                                         })
                     logging.debug('Train step_{}: loss : {},loss xy : {},loss wh : {},'
                                   'loss obj : {}，loss cls : {},loss l2 : {},lr : {}'
                                   .format(global_step, loss.item(), loss_xy.item(),
                                           loss_wh.item(), loss_obj.item(),
                                           loss_cls.item(), loss_l2.item(),
-                                          scheduler.get_lr()[0] * config.batch))
+                                          scheduler.get_last_lr()[0] * config.batch))
 
                 pbar.update(images.shape[0])
 
-            if cfg.use_darknet_cfg:
-                eval_model = Darknet(cfg.cfgfile, inference=True)
+            if epoch_step % config.subdivisions:
+                optimizer.step()
+                scheduler.step()
+                model.zero_grad()
+
+            if config.use_darknet_cfg:
+                eval_model = Darknet(config.cfgfile, inference=True, width=config.width, height=config.height)
             else:
-                eval_model = Yolov4(cfg.pretrained, n_classes=cfg.classes, inference=True)
+                eval_model = Yolov4(config.pretrained, n_classes=config.classes, inference=True)
             # eval_model = Yolov4(yolov4conv137weight=None, n_classes=config.classes, inference=True)
             if torch.cuda.device_count() > 1:
                 eval_model.load_state_dict(model.module.state_dict())
             else:
                 eval_model.load_state_dict(model.state_dict())
             eval_model.to(device)
+            eval_model.eval()
             evaluator = evaluate(eval_model, val_loader, config, device)
             del eval_model
 
@@ -447,10 +491,15 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 except OSError:
                     pass
                 save_path = os.path.join(config.checkpoints, f'{save_prefix}{epoch + 1}.pth')
-                if isinstance(model, torch.nn.DataParallel):
-                    torch.save(model.moduel,state_dict(), save_path)
-                else:
-                    torch.save(model.state_dict(), save_path)
+                state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+                torch.save({
+                    'model': state_dict,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'config': dict(config),
+                }, save_path)
                 logging.info(f'Checkpoint {epoch + 1} saved !')
                 saved_models.append(save_path)
                 if len(saved_models) > config.keep_checkpoint_max > 0:
@@ -496,18 +545,27 @@ def evaluate(model, data_loader, cfg, device, logger=None, **kwargs):
         for img, target, boxes, confs in zip(images, targets, outputs[0], outputs[1]):
             img_height, img_width = img.shape[:2]
             # boxes = output[...,:4].copy()  # output boxes in yolo format
-            boxes = boxes.squeeze(2).cpu().detach().numpy()
-            boxes[...,2:] = boxes[...,2:] - boxes[...,:2] # Transform [x1, y1, x2, y2] to [x1, y1, w, h]
-            boxes[...,0] = boxes[...,0]*img_width
-            boxes[...,1] = boxes[...,1]*img_height
-            boxes[...,2] = boxes[...,2]*img_width
-            boxes[...,3] = boxes[...,3]*img_height
-            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            boxes = boxes.reshape(-1, 4).cpu().detach().numpy()
             # confs = output[...,4:].copy()
             confs = confs.cpu().detach().numpy()
-            labels = np.argmax(confs, axis=1).flatten()
-            labels = torch.as_tensor(labels, dtype=torch.int64)
             scores = np.max(confs, axis=1).flatten()
+            labels = np.argmax(confs, axis=1).flatten()
+            keep = []
+            for label in np.unique(labels):
+                class_indices = np.where((labels == label) & (scores >= cfg.eval_conf_threshold))[0]
+                if class_indices.size:
+                    kept = nms_cpu(boxes[class_indices], scores[class_indices], cfg.nms_threshold)
+                    keep.extend(class_indices[kept].tolist())
+            keep = np.asarray(keep, dtype=np.int64)
+            boxes = np.clip(boxes[keep], 0.0, 1.0)
+            scores = scores[keep]
+            labels = labels[keep]
+            # COCO expects x, y, width, height in original-image pixels.
+            boxes[:, [0, 2]] *= img_width
+            boxes[:, [1, 3]] *= img_height
+            boxes[:, 2:] -= boxes[:, :2]
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            labels = torch.as_tensor(labels, dtype=torch.int64)
             scores = torch.as_tensor(scores, dtype=torch.float32)
             res[target["image_id"].item()] = {
                 "boxes": boxes,
@@ -544,7 +602,27 @@ def get_args(**kwargs):
                         help='dataset dir', dest='dataset_dir')
     parser.add_argument('-pretrained', type=str, default=None, help='pretrained yolov4.conv.137')
     parser.add_argument('-classes', type=int, default=80, help='dataset classes')
-    parser.add_argument('-train_label_path', dest='train_label', type=str, default='train.txt', help="train label path")
+    parser.add_argument('--cfg', dest='cfgfile', type=str, default=Cfg.cfgfile, help='Darknet model cfg')
+    parser.add_argument('--width', type=int, default=Cfg.width, help='network input width (must be divisible by 32)')
+    parser.add_argument('--height', type=int, default=Cfg.height, help='network input height (must be divisible by 32)')
+    parser.add_argument('--epochs', dest='TRAIN_EPOCHS', type=int, default=Cfg.TRAIN_EPOCHS)
+    parser.add_argument('--batch', type=int, default=Cfg.batch, help='effective batch size')
+    parser.add_argument('--subdivisions', type=int, default=Cfg.subdivisions, help='gradient-accumulation subdivisions')
+    parser.add_argument('--workers', type=int, default=4, help='data-loader worker processes')
+    parser.add_argument('--seed', type=int, default=0, help='random seed for split-independent reproducibility')
+    parser.add_argument('--mosaic', type=int, choices=[0, 1], default=Cfg.mosaic)
+    parser.add_argument('--letter-box', dest='letter_box', type=int, choices=[0, 1], default=Cfg.letter_box)
+    parser.add_argument('--jitter', type=float, default=Cfg.jitter)
+    parser.add_argument('--hue', type=float, default=Cfg.hue)
+    parser.add_argument('--saturation', type=float, default=Cfg.saturation)
+    parser.add_argument('--exposure', type=float, default=Cfg.exposure)
+    parser.add_argument('--flip', type=int, choices=[0, 1], default=Cfg.flip)
+    parser.add_argument('--checkpoints', type=str, default=Cfg.checkpoints)
+    parser.add_argument('--log-dir', dest='TRAIN_TENSORBOARD_DIR', type=str, default=Cfg.TRAIN_TENSORBOARD_DIR)
+    parser.add_argument('--eval-conf-threshold', dest='eval_conf_threshold', type=float, default=0.001)
+    parser.add_argument('--nms-threshold', dest='nms_threshold', type=float, default=0.5)
+    parser.add_argument('-train_label_path', dest='train_label', type=str, default=Cfg.train_label, help="train label path")
+    parser.add_argument('--val-label-path', dest='val_label', type=str, default=Cfg.val_label, help='validation label path')
     parser.add_argument(
         '-optimizer', type=str, default='adam',
         help='training optimizer',
@@ -562,6 +640,15 @@ def get_args(**kwargs):
     # for k in args.keys():
     #     cfg[k] = args.get(k)
     cfg.update(args)
+    cfg['w'] = cfg['width']
+    cfg['h'] = cfg['height']
+    if cfg['width'] % 32 or cfg['height'] % 32:
+        parser.error('--width and --height must each be divisible by 32')
+    if not cfg['use_darknet_cfg']:
+        parser.error('Only --use-darknet-cfg training is supported by the cfg-derived loss.')
+    if cfg['letter_box'] and cfg['mosaic']:
+        parser.error('--letter-box and --mosaic cannot both be enabled')
+    cfg['mixup'] = 3 if cfg['mosaic'] else 0
 
     return edict(cfg)
 
@@ -607,16 +694,29 @@ def _get_date_str():
 
 
 if __name__ == "__main__":
-    logging = init_logger(log_dir='log')
     cfg = get_args(**Cfg)
+    logging = init_logger(log_dir=cfg.TRAIN_TENSORBOARD_DIR)
     os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu
+    _seed_everything(cfg.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
     if cfg.use_darknet_cfg:
-        model = Darknet(cfg.cfgfile)
+        model = Darknet(cfg.cfgfile, width=cfg.width, height=cfg.height)
     else:
         model = Yolov4(cfg.pretrained, n_classes=cfg.classes)
+
+    resume_checkpoint = None
+    weights_path = cfg.load or cfg.pretrained
+    if cfg.use_darknet_cfg and weights_path:
+        if weights_path.endswith('.weights'):
+            model.load_weights(weights_path)
+        else:
+            checkpoint = torch.load(weights_path, map_location='cpu')
+            model.load_state_dict(checkpoint.get('model', checkpoint))
+            if cfg.load and isinstance(checkpoint, dict) and 'optimizer' in checkpoint:
+                resume_checkpoint = checkpoint
+        logging.info(f'Loaded weights from {weights_path}')
 
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
@@ -626,7 +726,8 @@ if __name__ == "__main__":
         train(model=model,
               config=cfg,
               epochs=cfg.TRAIN_EPOCHS,
-              device=device, )
+              device=device,
+              resume_checkpoint=resume_checkpoint)
     except KeyboardInterrupt:
         if isinstance(model, torch.nn.DataParallel):
             torch.save(model.module.state_dict(), 'INTERRUPTED.pth')

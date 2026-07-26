@@ -5,7 +5,6 @@ import numpy as np
 import copy
 import time
 import torch
-import torch._six
 
 from pycocotools.cocoeval import COCOeval
 from pycocotools.coco import COCO
@@ -255,7 +254,7 @@ def loadRes(self, resFile):
 
     # print('Loading and preparing results...')
     # tic = time.time()
-    if isinstance(resFile, torch._six.string_classes):
+    if isinstance(resFile, str):
         anns = json.load(open(resFile))
     elif type(resFile) == np.ndarray:
         anns = self.loadNumpyAnnotations(resFile)
@@ -273,7 +272,6 @@ def loadRes(self, resFile):
     elif 'bbox' in anns[0] and not anns[0]['bbox'] == []:
         res.dataset['categories'] = copy.deepcopy(self.dataset['categories'])
         for id, ann in enumerate(anns):
-            ann['bbox'] = ann['bbox'][0]
             bb = ann['bbox']
             x1, x2, y1, y2 = [bb[0], bb[0] + bb[2], bb[1], bb[1] + bb[3]]
             if 'segmentation' not in ann:
