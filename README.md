@@ -5,6 +5,17 @@
 [![](https://img.shields.io/static/v1?label=license&message=Apache2&color=green)](./License.txt)
 
 A minimal PyTorch implementation of YOLOv4.
+
+## Training diagnostic
+
+Before comparing a custom-data run with another framework, verify that the
+training graph can memorize a small sample. `train.py` supports
+`--overfit-samples N`, which trains and evaluates a deterministic prefix of N
+training images. Use a batch no larger than N, disable augmentation
+(`--mosaic 0 --jitter 0 --hue 0 --saturation 1 --exposure 1 --flip 0`), and
+expect the training-set AP to become very high. This mode is diagnostic only;
+it must not be used for benchmark results.
+
 - Paper Yolo v4: https://arxiv.org/abs/2004.10934
 - Source code:https://github.com/AlexeyAB/darknet
 - More details: http://pjreddie.com/darknet/yolo/

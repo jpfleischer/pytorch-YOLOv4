@@ -310,10 +310,25 @@ def _seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def _limit_dataset(dataset, max_samples):
+    """Keep a deterministic prefix of a Yolo_dataset for diagnostics."""
+    if not max_samples:
+        return dataset
+    dataset.imgs = dataset.imgs[:max_samples]
+    dataset.truth = {image: dataset.truth[image] for image in dataset.imgs}
+    return dataset
+
+
 def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5,
           resume_checkpoint=None):
     train_dataset = Yolo_dataset(config.train_label, config, train=True)
-    val_dataset = Yolo_dataset(config.val_label, config, train=False)
+    if config.overfit_samples:
+        train_dataset = _limit_dataset(train_dataset, config.overfit_samples)
+        # Evaluate the exact same images without training augmentation.  This
+        # is a graph/target/coordinate diagnostic, not a benchmark mode.
+        val_dataset = _limit_dataset(Yolo_dataset(config.train_label, config, train=False), config.overfit_samples)
+    else:
+        val_dataset = Yolo_dataset(config.val_label, config, train=False)
 
     n_train = len(train_dataset)
     n_val = len(val_dataset)
@@ -340,6 +355,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     max_itr = config.TRAIN_EPOCHS * n_train
     # global_step = cfg.TRAIN_MINEPOCH * n_train
     global_step = 0
+    optimizer_step = 0
     start_epoch = 0
     logging.info(f'''Starting training:
         Epochs:          {epochs}
@@ -389,6 +405,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         scheduler.load_state_dict(resume_checkpoint['scheduler'])
         start_epoch = int(resume_checkpoint['epoch'])
         global_step = int(resume_checkpoint.get('global_step', 0))
+        optimizer_step = int(resume_checkpoint.get('optimizer_step', global_step // config.subdivisions))
         logging.info(f'Resuming from epoch {start_epoch + 1}')
 
     base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
@@ -425,6 +442,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                     optimizer.step()
                     scheduler.step()
                     model.zero_grad()
+                    optimizer_step += 1
 
                 if global_step % (log_step * config.subdivisions) == 0:
                     writer.add_scalar('train/Loss', loss.item(), global_step)
@@ -454,43 +472,48 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 optimizer.step()
                 scheduler.step()
                 model.zero_grad()
+                optimizer_step += 1
 
-            if config.use_darknet_cfg:
-                eval_model = Darknet(config.cfgfile, inference=True, width=config.width, height=config.height)
-            else:
-                eval_model = Yolov4(config.pretrained, n_classes=config.classes, inference=True)
-            # eval_model = Yolov4(yolov4conv137weight=None, n_classes=config.classes, inference=True)
-            if torch.cuda.device_count() > 1:
-                eval_model.load_state_dict(model.module.state_dict())
-            else:
-                eval_model.load_state_dict(model.state_dict())
-            eval_model.to(device)
-            eval_model.eval()
-            evaluator = evaluate(eval_model, val_loader, config, device)
-            del eval_model
+            is_final_epoch = epoch + 1 == epochs
+            should_evaluate = is_final_epoch or optimizer_step % config.eval_interval == 0
+            if should_evaluate:
+                if config.use_darknet_cfg:
+                    eval_model = Darknet(config.cfgfile, inference=True, width=config.width, height=config.height)
+                else:
+                    eval_model = Yolov4(config.pretrained, n_classes=config.classes, inference=True)
+                # eval_model = Yolov4(yolov4conv137weight=None, n_classes=config.classes, inference=True)
+                if torch.cuda.device_count() > 1:
+                    eval_model.load_state_dict(model.module.state_dict())
+                else:
+                    eval_model.load_state_dict(model.state_dict())
+                eval_model.to(device)
+                eval_model.eval()
+                evaluator = evaluate(eval_model, val_loader, config, device)
+                del eval_model
 
-            stats = evaluator.coco_eval['bbox'].stats
-            writer.add_scalar('train/AP', stats[0], global_step)
-            writer.add_scalar('train/AP50', stats[1], global_step)
-            writer.add_scalar('train/AP75', stats[2], global_step)
-            writer.add_scalar('train/AP_small', stats[3], global_step)
-            writer.add_scalar('train/AP_medium', stats[4], global_step)
-            writer.add_scalar('train/AP_large', stats[5], global_step)
-            writer.add_scalar('train/AR1', stats[6], global_step)
-            writer.add_scalar('train/AR10', stats[7], global_step)
-            writer.add_scalar('train/AR100', stats[8], global_step)
-            writer.add_scalar('train/AR_small', stats[9], global_step)
-            writer.add_scalar('train/AR_medium', stats[10], global_step)
-            writer.add_scalar('train/AR_large', stats[11], global_step)
+                stats = evaluator.coco_eval['bbox'].stats
+                writer.add_scalar('train/AP', stats[0], optimizer_step)
+                writer.add_scalar('train/AP50', stats[1], optimizer_step)
+                writer.add_scalar('train/AP75', stats[2], optimizer_step)
+                writer.add_scalar('train/AP_small', stats[3], optimizer_step)
+                writer.add_scalar('train/AP_medium', stats[4], optimizer_step)
+                writer.add_scalar('train/AP_large', stats[5], optimizer_step)
+                writer.add_scalar('train/AR1', stats[6], optimizer_step)
+                writer.add_scalar('train/AR10', stats[7], optimizer_step)
+                writer.add_scalar('train/AR100', stats[8], optimizer_step)
+                writer.add_scalar('train/AR_small', stats[9], optimizer_step)
+                writer.add_scalar('train/AR_medium', stats[10], optimizer_step)
+                writer.add_scalar('train/AR_large', stats[11], optimizer_step)
 
-            if save_cp:
+            should_save = is_final_epoch or optimizer_step % config.checkpoint_interval == 0
+            if save_cp and should_save:
                 try:
                     # os.mkdir(config.checkpoints)
                     os.makedirs(config.checkpoints, exist_ok=True)
                     logging.info('Created checkpoint directory')
                 except OSError:
                     pass
-                save_path = os.path.join(config.checkpoints, f'{save_prefix}{epoch + 1}.pth')
+                save_path = os.path.join(config.checkpoints, f'{save_prefix}{optimizer_step}.pth')
                 state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
                 torch.save({
                     'model': state_dict,
@@ -498,9 +521,10 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                     'scheduler': scheduler.state_dict(),
                     'epoch': epoch + 1,
                     'global_step': global_step,
+                    'optimizer_step': optimizer_step,
                     'config': dict(config),
                 }, save_path)
-                logging.info(f'Checkpoint {epoch + 1} saved !')
+                logging.info(f'Checkpoint {optimizer_step} saved !')
                 saved_models.append(save_path)
                 if len(saved_models) > config.keep_checkpoint_max > 0:
                     model_to_remove = saved_models.popleft()
@@ -615,6 +639,12 @@ def get_args(**kwargs):
     parser.add_argument('--scales', type=float, nargs=2, default=Cfg.scales, metavar=('SCALE1', 'SCALE2'),
                         help='learning-rate multipliers at the two milestones')
     parser.add_argument('--workers', type=int, default=4, help='data-loader worker processes')
+    parser.add_argument('--eval-interval', type=int, default=100,
+                        help='evaluate every N optimizer updates (and at training end)')
+    parser.add_argument('--checkpoint-interval', type=int, default=1000,
+                        help='save a checkpoint every N optimizer updates (and at training end)')
+    parser.add_argument('--overfit-samples', type=int, default=0,
+                        help='diagnostic mode: train and evaluate a fixed prefix of N training images')
     parser.add_argument('--seed', type=int, default=0, help='random seed for split-independent reproducibility')
     parser.add_argument('--mosaic', type=int, choices=[0, 1], default=Cfg.mosaic)
     parser.add_argument('--letter-box', dest='letter_box', type=int, choices=[0, 1], default=Cfg.letter_box)
@@ -656,6 +686,10 @@ def get_args(**kwargs):
         parser.error('--steps must satisfy burn-in < STEP1 < STEP2')
     if any(scale <= 0 for scale in cfg['scales']):
         parser.error('--scales must be positive')
+    if cfg['eval_interval'] <= 0 or cfg['checkpoint_interval'] <= 0:
+        parser.error('--eval-interval and --checkpoint-interval must be positive')
+    if cfg['overfit_samples'] < 0:
+        parser.error('--overfit-samples must be non-negative')
     if not cfg['use_darknet_cfg']:
         parser.error('Only --use-darknet-cfg training is supported by the cfg-derived loss.')
     if cfg['letter_box'] and cfg['mosaic']:
