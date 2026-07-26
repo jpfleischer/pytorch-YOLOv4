@@ -71,10 +71,20 @@ you can use darknet2pytorch to convert it yourself, or download my converted mod
     ```
 3. Train
 
-    you can set parameters in cfg.py.
+    `cfg.py` supplies defaults; the training CLI overrides them. Inputs may be
+    rectangular as long as each dimension is divisible by 32. The selected
+    Darknet cfg must have its detection filters and `classes` fields adjusted
+    for the dataset.
     ```
-     python train.py -g [GPU_ID] -dir [Dataset direction] ...
+     python train.py -g 0 -dir /path/to/dataset \
+       --cfg cfg/yolov4-tiny.cfg --width 224 --height 160 \
+       -classes 5 -train_label_path /path/to/train.txt \
+       --val-label-path /path/to/val.txt --epochs 100
     ```
+
+    The label files use one image per line: `relative/image.jpg
+    x1,y1,x2,y2,class ...`. Training derives its anchors, strides, and grid
+    sizes from the selected cfg, including the two-head YOLOv4-tiny model.
 
 # 2. Inference
 
