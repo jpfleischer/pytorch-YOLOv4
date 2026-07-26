@@ -265,6 +265,30 @@ class Yolo_dataset(Dataset):
 
         self.truth = truth
         self.imgs = list(self.truth.keys())
+        self.cache_images = bool(getattr(cfg, 'cache_images', False))
+        self.image_cache = {}
+        if self.cache_images:
+            # Populate in the parent process.  Linux DataLoader workers fork
+            # this read-only cache, avoiding repeated JPEG decode without
+            # multiplying memory for every worker.
+            for img_path in self.imgs:
+                self._load_image(img_path)
+
+    def _resolve_image_path(self, img_path):
+        return os.path.join(self.cfg.dataset_dir, img_path)
+
+    def _load_image(self, img_path):
+        cached = self.image_cache.get(img_path)
+        if cached is not None:
+            return cached
+        full_path = self._resolve_image_path(img_path)
+        bgr = cv2.imread(full_path)
+        if bgr is None:
+            raise FileNotFoundError(f"Unable to read image: {full_path}")
+        image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if self.cache_images:
+            self.image_cache[img_path] = image
+        return image
 
     def __len__(self):
         return len(self.truth.keys())
@@ -274,7 +298,6 @@ class Yolo_dataset(Dataset):
             return self._get_val_item(index)
         img_path = self.imgs[index]
         bboxes = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
-        img_path = os.path.join(self.cfg.dataset_dir, img_path)
         use_mixup = self.cfg.mixup
         if random.randint(0, 1):
             use_mixup = 0
@@ -295,11 +318,7 @@ class Yolo_dataset(Dataset):
             if i != 0:
                 img_path = random.choice(list(self.truth.keys()))
                 bboxes = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
-                img_path = os.path.join(self.cfg.dataset_dir, img_path)
-            img = cv2.imread(img_path)
-            if img is None:
-                raise FileNotFoundError(f"Unable to read training image: {img_path}")
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = self._load_image(img_path)
             oh, ow, oc = img.shape
             dh, dw, dc = np.array(np.array([oh, ow, oc]) * self.cfg.jitter, dtype=np.int32)
 
@@ -394,9 +413,8 @@ class Yolo_dataset(Dataset):
         """
         img_path = self.imgs[index]
         bboxes_with_cls_id = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
-        img = cv2.imread(os.path.join(self.cfg.dataset_dir, img_path))
+        img = self._load_image(img_path)
         # img_height, img_width = img.shape[:2]
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         # img = cv2.resize(img, (self.cfg.w, self.cfg.h))
         # img = torch.from_numpy(img.transpose(2, 0, 1)).float().div(255.0).unsqueeze(0)
         num_objs = len(bboxes_with_cls_id)

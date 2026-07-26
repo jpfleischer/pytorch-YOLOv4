@@ -963,6 +963,8 @@ def get_args(**kwargs):
                         help='evaluate every N optimizer updates (and at training end)')
     parser.add_argument('--checkpoint-interval', type=int, default=1000,
                         help='save a checkpoint every N optimizer updates (and at training end)')
+    parser.add_argument('--cache-images', type=int, choices=[0, 1], default=Cfg.cache_images,
+                        help='cache decoded RGB source images before DataLoader workers start')
     parser.add_argument('--early-stopping-patience', type=int, default=Cfg.early_stopping_patience,
                         help='stop after N non-improving AP50-95 evaluations; 0 disables stopping')
     parser.add_argument('--early-stopping-min-delta', type=float, default=Cfg.early_stopping_min_delta,
