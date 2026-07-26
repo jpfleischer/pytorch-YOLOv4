@@ -34,6 +34,9 @@ Cfg.exposure = 1.5
 Cfg.hue = .1
 
 Cfg.learning_rate = 0.00261
+# ``darknet`` reads the [yolo] loss settings (including CIoU) from the cfg.
+# ``legacy`` is retained only to reproduce earlier fork experiments.
+Cfg.loss_mode = 'darknet'
 Cfg.burn_in = 1000
 Cfg.max_batches = 500500
 Cfg.steps = [400000, 450000]

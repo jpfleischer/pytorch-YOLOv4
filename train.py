@@ -136,15 +136,17 @@ class Yolo_loss(nn.Module):
     the tensors from each output fixes rectangular inputs and YOLOv4-tiny's two
     detection heads.
     """
-    def __init__(self, output_specs, n_classes, device=None):
+    def __init__(self, output_specs, n_classes, device=None, loss_mode='darknet'):
         super().__init__()
         self.device = device
         self.n_classes = n_classes
-        self.ignore_thre = 0.5
         self.output_specs = output_specs
+        if loss_mode not in {'darknet', 'legacy'}:
+            raise ValueError(f'Unsupported loss mode: {loss_mode}')
+        self.loss_mode = loss_mode
 
     @classmethod
-    def from_darknet(cls, model, n_classes, device=None):
+    def from_darknet(cls, model, n_classes, device=None, loss_mode='darknet'):
         specs = []
         for block, layer in zip(model.blocks[1:], model.models):
             if block['type'] == 'yolo':
@@ -154,10 +156,18 @@ class Yolo_loss(nn.Module):
                     'anchors': anchors,
                     'mask': list(layer.anchor_mask),
                     'scale_x_y': float(layer.scale_x_y),
+                    # Match Darknet's per-[yolo] setting rather than using a
+                    # global hard-coded threshold.  Darknet defaults to .5
+                    # when the cfg omits it.
+                    'ignore_thresh': float(block.get('ignore_thresh', 0.5)),
+                    'iou_loss': block.get('iou_loss', 'mse').lower(),
+                    'iou_normalizer': float(block.get('iou_normalizer', 0.75)),
+                    'obj_normalizer': float(block.get('obj_normalizer', 1.0)),
+                    'cls_normalizer': float(block.get('cls_normalizer', 1.0)),
                 })
         if not specs:
             raise ValueError('The selected cfg contains no [yolo] detection layers.')
-        return cls(specs, n_classes=n_classes, device=device)
+        return cls(specs, n_classes=n_classes, device=device, loss_mode=loss_mode)
 
     def build_target(self, pred, labels, batchsize, grid_h, grid_w, n_ch, output_id):
         # target assignment
@@ -202,18 +212,20 @@ class Yolo_loss(nn.Module):
                 [int(anchor) in mask_to_output for anchor in best_n_all.tolist()], device=self.device, dtype=torch.bool
             )
 
-            if sum(best_n_mask) == 0:
-                continue
-
             truth_box[:n, 0] = truth_x_all[b, :n]
             truth_box[:n, 1] = truth_y_all[b, :n]
 
             pred_ious = bboxes_iou(pred[b].reshape(-1, 4), truth_box, xyxy=False)
             pred_best_iou, _ = pred_ious.max(dim=1)
-            pred_best_iou = (pred_best_iou > self.ignore_thre)
+            pred_best_iou = (pred_best_iou > spec['ignore_thresh'])
             pred_best_iou = pred_best_iou.view(pred[b].shape[:3])
             # set mask to zero (ignore) if pred matches truth
             obj_mask[b] = ~ pred_best_iou
+
+            # Darknet applies the ignore rule above to every head, including
+            # heads that have no positive assignment for this image.
+            if not best_n_mask.any():
+                continue
 
             for ti in range(best_n_all.shape[0]):
                 if best_n_mask[ti] == 1:
@@ -236,12 +248,18 @@ class Yolo_loss(nn.Module):
         return obj_mask, tgt_mask, tgt_scale, target
 
     def forward(self, xin, labels=None):
-        loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = 0, 0, 0, 0, 0, 0
+        # Keep every reported component as a tensor.  Darknet CIoU mode does
+        # not use the historical ``loss_wh``/``loss_l2`` terms, but callers
+        # still log them every training step.
+        loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = (
+            xin[0].new_zeros(()) for _ in range(6)
+        )
         for output_id, output in enumerate(xin):
+            spec = self.output_specs[output_id]
             batchsize = output.shape[0]
             grid_h, grid_w = output.shape[2:]
             n_ch = 5 + self.n_classes
-            n_anchors = len(self.output_specs[output_id]['mask'])
+            n_anchors = len(spec['mask'])
             expected_channels = n_anchors * n_ch
             if output.shape[1] != expected_channels:
                 raise ValueError(
@@ -260,55 +278,101 @@ class Yolo_loss(nn.Module):
             cls_logits = output[..., 5:].clone()
 
             # logistic activation for xy, obj, cls
+            output = output.clone()
             output[..., np.r_[:2, 4:n_ch]] = torch.sigmoid(output[..., np.r_[:2, 4:n_ch]])
 
-            pred = output[..., :4].clone()
             y, x = torch.meshgrid(torch.arange(grid_h, device=output.device), torch.arange(grid_w, device=output.device), indexing='ij')
-            anchors = torch.as_tensor(self.output_specs[output_id]['anchors'], device=output.device).view(-1, 2)[self.output_specs[output_id]['mask']] / self.output_specs[output_id]['stride']
-            scale_x_y = self.output_specs[output_id]['scale_x_y']
-            pred[..., 0] = pred[..., 0] * scale_x_y - 0.5 * (scale_x_y - 1) + x
-            pred[..., 1] = pred[..., 1] * scale_x_y - 0.5 * (scale_x_y - 1) + y
-            pred[..., 2] = torch.exp(pred[..., 2]) * anchors[:, 0].view(1, -1, 1, 1)
-            pred[..., 3] = torch.exp(pred[..., 3]) * anchors[:, 1].view(1, -1, 1, 1)
+            anchors = torch.as_tensor(spec['anchors'], device=output.device).view(-1, 2)[spec['mask']] / spec['stride']
+            scale_x_y = spec['scale_x_y']
+            # Assignment and ignore-mask comparisons are non-differentiable.
+            # Detach them so extreme logits in an unselected cell cannot make
+            # an ExpBackward(0 * inf) NaN during CIoU training.
+            with torch.no_grad():
+                assignment_pred = output[..., :4].clone()
+                assignment_pred[..., 0] = assignment_pred[..., 0] * scale_x_y - 0.5 * (scale_x_y - 1) + x
+                assignment_pred[..., 1] = assignment_pred[..., 1] * scale_x_y - 0.5 * (scale_x_y - 1) + y
+                assignment_pred[..., 2] = torch.exp(assignment_pred[..., 2]) * anchors[:, 0].view(1, -1, 1, 1)
+                assignment_pred[..., 3] = torch.exp(assignment_pred[..., 3]) * anchors[:, 1].view(1, -1, 1, 1)
 
-            obj_mask, tgt_mask, tgt_scale, target = self.build_target(pred, labels, batchsize, grid_h, grid_w, n_ch, output_id)
+            obj_mask, tgt_mask, tgt_scale, target = self.build_target(
+                assignment_pred, labels, batchsize, grid_h, grid_w, n_ch, output_id,
+            )
 
-            # loss calculation
-            output[..., 4] *= obj_mask
-            output[..., np.r_[0:4, 5:n_ch]] *= tgt_mask
-            output[..., 2:4] *= tgt_scale
-
-            target[..., 4] *= obj_mask
-            target[..., np.r_[0:4, 5:n_ch]] *= tgt_mask
-            target[..., 2:4] *= tgt_scale
-
-            loss_xy += F.binary_cross_entropy(input=output[..., :2], target=target[..., :2],
-                                              weight=tgt_scale * tgt_scale, reduction='sum')
-            loss_wh += F.mse_loss(input=output[..., 2:4], target=target[..., 2:4], reduction='sum') / 2
-            # Objectness has thousands of negative cells for a handful of
-            # positive cells.  Balance the two groups so negative examples
-            # cannot collapse every objectness logit before positives learn.
             active_obj = obj_mask.bool()
-            positive_obj = active_obj & target[..., 4].bool()
-            negative_obj = active_obj & ~target[..., 4].bool()
-            if positive_obj.any():
-                positive_loss = F.binary_cross_entropy_with_logits(
-                    obj_logits[positive_obj], target[..., 4][positive_obj], reduction='sum',
-                )
-                loss_obj += positive_loss
-            if negative_obj.any():
-                negative_loss = F.binary_cross_entropy_with_logits(
-                    obj_logits[negative_obj], target[..., 4][negative_obj], reduction='sum',
-                )
-                # Give positives and negatives equal aggregate influence.
-                loss_obj += negative_loss * (positive_obj.sum() / negative_obj.sum()).to(negative_loss.dtype)
-
             positive_cls = target[..., 4].bool()
-            if positive_cls.any():
-                loss_cls += F.binary_cross_entropy_with_logits(
-                    cls_logits[positive_cls], target[..., 5:][positive_cls], reduction='sum',
+
+            if self.loss_mode == 'darknet':
+                # Darknet's objectness delta is target - sigmoid(logit) for
+                # every non-ignored prediction: ordinary, unbalanced BCE.
+                loss_obj += spec['obj_normalizer'] * F.binary_cross_entropy_with_logits(
+                    obj_logits[active_obj], target[..., 4][active_obj], reduction='sum',
                 )
-            loss_l2 += F.mse_loss(input=output, target=target, reduction='sum')
+                if positive_cls.any():
+                    loss_cls += spec['cls_normalizer'] * F.binary_cross_entropy_with_logits(
+                        cls_logits[positive_cls], target[..., 5:][positive_cls], reduction='sum',
+                    )
+
+                    # The cfg's CIoU/DIoU/GIoU setting is applied to decoded
+                    # boxes, exactly as Darknet's delta_yolo_box() does.
+                    grid = torch.stack((x, y), dim=-1).view(1, 1, grid_h, grid_w, 2)
+                    grid = grid.expand(batchsize, n_anchors, -1, -1, -1)[positive_cls]
+                    positive_anchors = anchors.view(1, n_anchors, 1, 1, 2).expand(
+                        batchsize, -1, grid_h, grid_w, -1,
+                    )[positive_cls]
+                    positive_output = output[positive_cls]
+                    positive_target = target[positive_cls]
+                    pred_box = torch.empty_like(positive_output[:, :4])
+                    pred_box[:, :2] = positive_output[:, :2] * scale_x_y - 0.5 * (scale_x_y - 1) + grid
+                    pred_box[:, 2:4] = torch.exp(positive_output[:, 2:4]) * positive_anchors
+                    target_box = torch.empty_like(pred_box)
+                    target_box[:, :2] = positive_target[:, :2] * scale_x_y - 0.5 * (scale_x_y - 1) + grid
+                    target_box[:, 2:4] = torch.exp(positive_target[:, 2:4]) * positive_anchors
+                    kind = spec['iou_loss']
+                    if kind == 'ciou':
+                        quality = bboxes_iou(pred_box, target_box, xyxy=False, CIoU=True).diagonal()
+                    elif kind == 'diou':
+                        quality = bboxes_iou(pred_box, target_box, xyxy=False, DIoU=True).diagonal()
+                    elif kind == 'giou':
+                        quality = bboxes_iou(pred_box, target_box, xyxy=False, GIoU=True).diagonal()
+                    elif kind == 'iou':
+                        quality = bboxes_iou(pred_box, target_box, xyxy=False).diagonal()
+                    else:
+                        raise ValueError(f"Darknet loss mode does not support iou_loss={kind!r}; use --loss-mode legacy.")
+                    # ``loss_xy`` remains the historical return slot used by
+                    # the logger; in Darknet mode it contains the full box loss.
+                    loss_xy += spec['iou_normalizer'] * (1 - quality).sum()
+            else:
+                # Kept for reproducing prior fork experiments.  This is not
+                # equivalent to a cfg with ``iou_loss=ciou``.
+                legacy_output = output.clone()
+                legacy_target = target.clone()
+                legacy_output[..., 4] *= obj_mask
+                legacy_output[..., np.r_[0:4, 5:n_ch]] *= tgt_mask
+                legacy_output[..., 2:4] *= tgt_scale
+                legacy_target[..., 4] *= obj_mask
+                legacy_target[..., np.r_[0:4, 5:n_ch]] *= tgt_mask
+                legacy_target[..., 2:4] *= tgt_scale
+                loss_xy += F.binary_cross_entropy(
+                    input=legacy_output[..., :2], target=legacy_target[..., :2],
+                    weight=tgt_scale * tgt_scale, reduction='sum',
+                )
+                loss_wh += F.mse_loss(input=legacy_output[..., 2:4], target=legacy_target[..., 2:4], reduction='sum') / 2
+                positive_obj = active_obj & target[..., 4].bool()
+                negative_obj = active_obj & ~target[..., 4].bool()
+                if positive_obj.any():
+                    loss_obj += F.binary_cross_entropy_with_logits(
+                        obj_logits[positive_obj], target[..., 4][positive_obj], reduction='sum',
+                    )
+                if negative_obj.any():
+                    negative_loss = F.binary_cross_entropy_with_logits(
+                        obj_logits[negative_obj], target[..., 4][negative_obj], reduction='sum',
+                    )
+                    loss_obj += negative_loss * (positive_obj.sum() / negative_obj.sum()).to(negative_loss.dtype)
+                if positive_cls.any():
+                    loss_cls += F.binary_cross_entropy_with_logits(
+                        cls_logits[positive_cls], target[..., 5:][positive_cls], reduction='sum',
+                    )
+                loss_l2 += F.mse_loss(input=legacy_output, target=legacy_target, reduction='sum')
 
         loss = loss_xy + loss_wh + loss_obj + loss_cls
 
@@ -437,7 +501,9 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         logging.info(f'Resuming from epoch {start_epoch + 1}')
 
     base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
-    criterion = Yolo_loss.from_darknet(base_model, n_classes=config.classes, device=device)
+    criterion = Yolo_loss.from_darknet(
+        base_model, n_classes=config.classes, device=device, loss_mode=config.loss_mode,
+    )
     # scheduler = ReduceLROnPlateau(optimizer, mode='max', verbose=True, patience=6, min_lr=1e-7)
     # scheduler = CosineAnnealingWarmRestarts(optimizer, 0.001, 1e-6, 20)
 
@@ -671,6 +737,8 @@ def get_args(**kwargs):
                         help='evaluate every N optimizer updates (and at training end)')
     parser.add_argument('--checkpoint-interval', type=int, default=1000,
                         help='save a checkpoint every N optimizer updates (and at training end)')
+    parser.add_argument('--loss-mode', choices=('darknet', 'legacy'), default=Cfg.loss_mode,
+                        help='darknet: cfg-driven objectness/IoU loss; legacy: prior balanced BCE/MSE loss')
     parser.add_argument('--overfit-samples', type=int, default=0,
                         help='diagnostic mode: train and evaluate a fixed prefix of N training images')
     parser.add_argument('--seed', type=int, default=0, help='random seed for split-independent reproducibility')
