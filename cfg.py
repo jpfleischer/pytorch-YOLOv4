@@ -79,3 +79,7 @@ Cfg.TRAIN_TENSORBOARD_DIR = os.path.join(_BASE_DIR, 'log')
 Cfg.iou_type = 'iou'  # 'giou', 'diou', 'ciou'
 
 Cfg.keep_checkpoint_max = 10
+# AP50-95 validation early stopping.  A value of 0 disables stopping while
+# retaining best-checkpoint tracking.
+Cfg.early_stopping_patience = 10
+Cfg.early_stopping_min_delta = 0.001

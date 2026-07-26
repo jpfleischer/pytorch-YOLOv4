@@ -558,6 +558,42 @@ def _limit_dataset(dataset, max_samples):
     return dataset
 
 
+class EarlyStopping:
+    """Track validation AP50-95 and optionally stop after a plateau."""
+
+    def __init__(self, patience, min_delta):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_metric = float('-inf')
+        self.best_step = 0
+        self.bad_evaluations = 0
+
+    def update(self, metric, step):
+        improved = math.isfinite(metric) and metric > self.best_metric + self.min_delta
+        if improved:
+            self.best_metric = metric
+            self.best_step = step
+            self.bad_evaluations = 0
+        else:
+            self.bad_evaluations += 1
+        should_stop = self.patience > 0 and self.bad_evaluations >= self.patience
+        return improved, should_stop
+
+    def state_dict(self):
+        return {
+            'best_metric': self.best_metric,
+            'best_step': self.best_step,
+            'bad_evaluations': self.bad_evaluations,
+        }
+
+    def load_state_dict(self, state):
+        if not state:
+            return
+        self.best_metric = float(state.get('best_metric', self.best_metric))
+        self.best_step = int(state.get('best_step', self.best_step))
+        self.bad_evaluations = int(state.get('bad_evaluations', self.bad_evaluations))
+
+
 def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5,
           resume_checkpoint=None):
     train_dataset = Yolo_dataset(config.train_label, config, train=True)
@@ -596,6 +632,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     global_step = 0
     optimizer_step = 0
     start_epoch = 0
+    early_stopping = EarlyStopping(config.early_stopping_patience, config.early_stopping_min_delta)
     logging.info(f'''Starting training:
         Epochs:          {epochs}
         Batch size:      {config.batch}
@@ -645,6 +682,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         start_epoch = int(resume_checkpoint['epoch'])
         global_step = int(resume_checkpoint.get('global_step', 0))
         optimizer_step = int(resume_checkpoint.get('optimizer_step', global_step // config.subdivisions))
+        early_stopping.load_state_dict(resume_checkpoint.get('early_stopping'))
         logging.info(f'Resuming from epoch {start_epoch + 1}')
 
     base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
@@ -656,6 +694,21 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
 
     save_prefix = 'Yolov4_epoch'
     saved_models = deque()
+
+    def checkpoint_payload(epoch, validation_ap=None):
+        state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+        return {
+            'model': state_dict,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'epoch': epoch + 1,
+            'global_step': global_step,
+            'optimizer_step': optimizer_step,
+            'early_stopping': early_stopping.state_dict(),
+            'validation_ap50_95': validation_ap,
+            'config': dict(config),
+        }
+
     model.train()
     for epoch in range(start_epoch, epochs):
         # model.train()
@@ -717,6 +770,8 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
 
             is_final_epoch = epoch + 1 == epochs
             should_evaluate = is_final_epoch or optimizer_step % config.eval_interval == 0
+            stop_early = False
+            validation_ap = None
             if should_evaluate:
                 if config.use_darknet_cfg:
                     eval_model = Darknet(config.cfgfile, inference=True, width=config.width, height=config.height)
@@ -733,6 +788,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 del eval_model
 
                 stats = evaluator.coco_eval['bbox'].stats
+                validation_ap = float(stats[0])
                 writer.add_scalar('train/AP', stats[0], optimizer_step)
                 writer.add_scalar('train/AP50', stats[1], optimizer_step)
                 writer.add_scalar('train/AP75', stats[2], optimizer_step)
@@ -745,8 +801,24 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 writer.add_scalar('train/AR_small', stats[9], optimizer_step)
                 writer.add_scalar('train/AR_medium', stats[10], optimizer_step)
                 writer.add_scalar('train/AR_large', stats[11], optimizer_step)
+                improved, stop_early = early_stopping.update(validation_ap, optimizer_step)
+                writer.add_scalar('train/early_stopping_bad_evaluations', early_stopping.bad_evaluations, optimizer_step)
+                if improved:
+                    os.makedirs(config.checkpoints, exist_ok=True)
+                    best_path = os.path.join(config.checkpoints, 'Yolov4_best.pth')
+                    torch.save(checkpoint_payload(epoch, validation_ap), best_path)
+                    logging.info(
+                        'Best checkpoint saved at update %d: AP50-95=%.6f', optimizer_step, validation_ap,
+                    )
+                elif stop_early:
+                    logging.info(
+                        'Early stopping at update %d after %d non-improving evaluations; '
+                        'best AP50-95=%.6f at update %d',
+                        optimizer_step, early_stopping.bad_evaluations,
+                        early_stopping.best_metric, early_stopping.best_step,
+                    )
 
-            should_save = is_final_epoch or optimizer_step % config.checkpoint_interval == 0
+            should_save = is_final_epoch or stop_early or optimizer_step % config.checkpoint_interval == 0
             if save_cp and should_save:
                 try:
                     # os.mkdir(config.checkpoints)
@@ -755,16 +827,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 except OSError:
                     pass
                 save_path = os.path.join(config.checkpoints, f'{save_prefix}{optimizer_step}.pth')
-                state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
-                torch.save({
-                    'model': state_dict,
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'epoch': epoch + 1,
-                    'global_step': global_step,
-                    'optimizer_step': optimizer_step,
-                    'config': dict(config),
-                }, save_path)
+                torch.save(checkpoint_payload(epoch, validation_ap), save_path)
                 logging.info(f'Checkpoint {optimizer_step} saved !')
                 saved_models.append(save_path)
                 if len(saved_models) > config.keep_checkpoint_max > 0:
@@ -773,6 +836,9 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                         os.remove(model_to_remove)
                     except:
                         logging.info(f'failed to remove {model_to_remove}')
+
+            if stop_early:
+                break
 
     writer.close()
 
@@ -884,6 +950,10 @@ def get_args(**kwargs):
                         help='evaluate every N optimizer updates (and at training end)')
     parser.add_argument('--checkpoint-interval', type=int, default=1000,
                         help='save a checkpoint every N optimizer updates (and at training end)')
+    parser.add_argument('--early-stopping-patience', type=int, default=Cfg.early_stopping_patience,
+                        help='stop after N non-improving AP50-95 evaluations; 0 disables stopping')
+    parser.add_argument('--early-stopping-min-delta', type=float, default=Cfg.early_stopping_min_delta,
+                        help='minimum AP50-95 improvement that resets early-stopping patience')
     parser.add_argument('--loss-mode', choices=('darknet', 'legacy'), default=Cfg.loss_mode,
                         help='darknet: cfg-driven objectness/IoU loss; legacy: prior balanced BCE/MSE loss')
     parser.add_argument('--overfit-samples', type=int, default=0,
@@ -931,6 +1001,10 @@ def get_args(**kwargs):
         parser.error('--scales must be positive')
     if cfg['eval_interval'] <= 0 or cfg['checkpoint_interval'] <= 0:
         parser.error('--eval-interval and --checkpoint-interval must be positive')
+    if cfg['early_stopping_patience'] < 0:
+        parser.error('--early-stopping-patience must be non-negative')
+    if cfg['early_stopping_min_delta'] < 0:
+        parser.error('--early-stopping-min-delta must be non-negative')
     if cfg['overfit_samples'] < 0:
         parser.error('--overfit-samples must be non-negative')
     if not cfg['use_darknet_cfg']:
