@@ -252,6 +252,13 @@ class Yolo_loss(nn.Module):
             output = output.view(batchsize, n_anchors, n_ch, grid_h, grid_w)
             output = output.permute(0, 1, 3, 4, 2)  # .contiguous()
 
+            # Keep the logits for objectness/classification loss.  Applying
+            # sigmoid first and feeding the result to BCELoss can underflow to
+            # exact zero after a few negative-heavy updates, at which point
+            # the positive-object gradient is lost permanently.
+            obj_logits = output[..., 4].clone()
+            cls_logits = output[..., 5:].clone()
+
             # logistic activation for xy, obj, cls
             output[..., np.r_[:2, 4:n_ch]] = torch.sigmoid(output[..., np.r_[:2, 4:n_ch]])
 
@@ -278,8 +285,29 @@ class Yolo_loss(nn.Module):
             loss_xy += F.binary_cross_entropy(input=output[..., :2], target=target[..., :2],
                                               weight=tgt_scale * tgt_scale, reduction='sum')
             loss_wh += F.mse_loss(input=output[..., 2:4], target=target[..., 2:4], reduction='sum') / 2
-            loss_obj += F.binary_cross_entropy(input=output[..., 4], target=target[..., 4], reduction='sum')
-            loss_cls += F.binary_cross_entropy(input=output[..., 5:], target=target[..., 5:], reduction='sum')
+            # Objectness has thousands of negative cells for a handful of
+            # positive cells.  Balance the two groups so negative examples
+            # cannot collapse every objectness logit before positives learn.
+            active_obj = obj_mask.bool()
+            positive_obj = active_obj & target[..., 4].bool()
+            negative_obj = active_obj & ~target[..., 4].bool()
+            if positive_obj.any():
+                positive_loss = F.binary_cross_entropy_with_logits(
+                    obj_logits[positive_obj], target[..., 4][positive_obj], reduction='sum',
+                )
+                loss_obj += positive_loss
+            if negative_obj.any():
+                negative_loss = F.binary_cross_entropy_with_logits(
+                    obj_logits[negative_obj], target[..., 4][negative_obj], reduction='sum',
+                )
+                # Give positives and negatives equal aggregate influence.
+                loss_obj += negative_loss * (positive_obj.sum() / negative_obj.sum()).to(negative_loss.dtype)
+
+            positive_cls = target[..., 4].bool()
+            if positive_cls.any():
+                loss_cls += F.binary_cross_entropy_with_logits(
+                    cls_logits[positive_cls], target[..., 5:][positive_cls], reduction='sum',
+                )
             loss_l2 += F.mse_loss(input=output, target=target, reduction='sum')
 
         loss = loss_xy + loss_wh + loss_obj + loss_cls
