@@ -558,6 +558,19 @@ def _limit_dataset(dataset, max_samples):
     return dataset
 
 
+def data_loader_kwargs(workers, device):
+    """Use persistent loader processes when a run spans many short epochs."""
+    kwargs = {
+        'num_workers': workers,
+        'pin_memory': device.type == 'cuda',
+    }
+    if workers > 0:
+        # LEGO's batch-64 setup has one batch per epoch.  Without this,
+        # PyTorch tears down and respawns all workers thousands of times.
+        kwargs.update(persistent_workers=True, prefetch_factor=2)
+    return kwargs
+
+
 class EarlyStopping:
     """Track validation AP50-95 and optionally stop after a plateau."""
 
@@ -613,13 +626,13 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         raise ValueError('batch must be greater than or equal to subdivisions')
     generator = torch.Generator().manual_seed(config.seed)
     worker_init_fn = lambda worker_id: _seed_everything(config.seed + worker_id)
-    train_loader = DataLoader(train_dataset, batch_size=micro_batch, shuffle=True,
-                              num_workers=config.workers, pin_memory=device.type == 'cuda', drop_last=True,
-                              collate_fn=collate, generator=generator, worker_init_fn=worker_init_fn)
+    train_loader = DataLoader(train_dataset, batch_size=micro_batch, shuffle=True, drop_last=True,
+                              collate_fn=collate, generator=generator, worker_init_fn=worker_init_fn,
+                              **data_loader_kwargs(config.workers, device))
 
-    val_loader = DataLoader(val_dataset, batch_size=micro_batch, shuffle=False, num_workers=config.workers,
-                            pin_memory=device.type == 'cuda', drop_last=False, collate_fn=val_collate,
-                            worker_init_fn=worker_init_fn)
+    val_loader = DataLoader(val_dataset, batch_size=micro_batch, shuffle=False, drop_last=False,
+                            collate_fn=val_collate, worker_init_fn=worker_init_fn,
+                            **data_loader_kwargs(config.workers, device))
 
     writer = SummaryWriter(log_dir=config.TRAIN_TENSORBOARD_DIR,
                            filename_suffix=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}',
