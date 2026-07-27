@@ -906,9 +906,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     updates_per_epoch = math.ceil(len(train_loader) / config.subdivisions)
     planned_updates = epochs * updates_per_epoch
     interactive_progress = bool(getattr(sys.stderr, 'isatty', lambda: False)())
-    progress_report_interval_s = 5.0
     progress_started_at = time.monotonic()
-    last_progress_report_at = progress_started_at
     starting_optimizer_step = optimizer_step
     pbar = tqdm(
         total=planned_updates,
@@ -916,26 +914,22 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         desc='Training',
         unit='update',
         ncols=80,
-        mininterval=progress_report_interval_s,
+        mininterval=0.5,
         disable=not interactive_progress,
     )
 
-    def report_progress(*, epoch: int, loss_value: float, force: bool = False) -> None:
-        """Write visible progress through Docker/tee when tqdm cannot redraw."""
-        nonlocal last_progress_report_at
+    def report_progress(*, epoch: int, loss_value: float) -> None:
+        """Write one visible, unambiguous line for every Docker optimizer update."""
         if interactive_progress:
             return
         now = time.monotonic()
-        if not force and now - last_progress_report_at < progress_report_interval_s:
-            return
         elapsed = max(now - progress_started_at, 1e-9)
         rate = (optimizer_step - starting_optimizer_step) / elapsed
         logging.info(
-            'Training progress: update %d/%d (%.1f%%), %.2f updates/s, epoch %d/%d, loss=%.6f',
+            'Training update %d/%d (%.1f%%), %.2f updates/s, epoch %d/%d, loss=%.6f',
             optimizer_step, planned_updates, 100.0 * optimizer_step / max(planned_updates, 1),
             rate, epoch + 1, epochs, loss_value,
         )
-        last_progress_report_at = now
     for epoch in range(start_epoch, epochs):
         # model.train()
         epoch_loss = 0
@@ -1041,11 +1035,11 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 model.zero_grad()
                 optimizer_step += 1
                 pbar.update(1)
+                report_progress(epoch=epoch, loss_value=loss.item())
 
             is_final_epoch = epoch + 1 == epochs
             if interactive_progress:
                 pbar.set_postfix(**{'epoch': f'{epoch + 1}/{epochs}', 'loss (batch)': loss.item()})
-            report_progress(epoch=epoch, loss_value=loss.item(), force=is_final_epoch)
 
             profile_complete = profiler.complete(optimizer_step)
             should_evaluate = is_final_epoch or profile_complete or optimizer_step % config.eval_interval == 0
@@ -1121,7 +1115,6 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                         logging.info(f'failed to remove {model_to_remove}')
 
             if stop_early or profile_complete:
-                report_progress(epoch=epoch, loss_value=loss.item(), force=True)
                 break
 
     pbar.close()
