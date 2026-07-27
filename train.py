@@ -902,12 +902,16 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         }
 
     model.train()
+    updates_per_epoch = math.ceil(len(train_loader) / config.subdivisions)
+    planned_updates = epochs * updates_per_epoch
     for epoch in range(start_epoch, epochs):
         # model.train()
         epoch_loss = 0
         epoch_step = 0
 
-        with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img', ncols=50) as pbar:
+        progress_context = f'epoch {epoch + 1}/{epochs}'
+        next_update = min(optimizer_step + 1, planned_updates)
+        with tqdm(total=n_train, desc=f'Update {next_update}/{planned_updates} ({progress_context})', unit='img', ncols=50) as pbar:
             train_iterator = iter(train_loader)
             while True:
                 capture_profile = profiler.capture_training(optimizer_step)
@@ -972,6 +976,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                     scheduler.step()
                     model.zero_grad()
                     optimizer_step += 1
+                    pbar.set_description(f'Update {optimizer_step}/{planned_updates} ({progress_context})')
                     if capture_profile:
                         _synchronize(device)
                         profiler.record('train_optimizer_s', time.perf_counter() - phase_start)
@@ -1005,6 +1010,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 scheduler.step()
                 model.zero_grad()
                 optimizer_step += 1
+                pbar.set_description(f'Update {optimizer_step}/{planned_updates} ({progress_context})')
 
             is_final_epoch = epoch + 1 == epochs
             profile_complete = profiler.complete(optimizer_step)
