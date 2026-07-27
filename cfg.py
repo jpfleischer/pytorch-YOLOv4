@@ -82,7 +82,7 @@ Cfg.keep_checkpoint_max = 10
 # Cache decoded RGB source images before worker processes are forked.  Random
 # crop/color augmentation remains in ``__getitem__`` and is not cached.
 Cfg.cache_images = 1
-# AP50-95 validation early stopping.  A value of 0 disables stopping while
-# retaining best-checkpoint tracking.
-Cfg.early_stopping_patience = 10
+# AP50-95 validation early stopping.  Benchmarks run the complete scheduled
+# update budget by default; a positive CLI value enables exploratory stopping.
+Cfg.early_stopping_patience = 0
 Cfg.early_stopping_min_delta = 0.001
