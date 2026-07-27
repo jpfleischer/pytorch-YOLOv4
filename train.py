@@ -11,10 +11,11 @@
 
 '''
 import time
+import json
 import logging
 import os, sys, math
 import argparse
-from collections import deque
+from collections import deque, defaultdict
 import datetime
 import random
 
@@ -277,6 +278,20 @@ class Yolo_loss(nn.Module):
         if loss_mode not in {'darknet', 'legacy'}:
             raise ValueError(f'Unsupported loss mode: {loss_mode}')
         self.loss_mode = loss_mode
+        self.profile_enabled = False
+        self.profile_phases = defaultdict(float)
+
+    def _profile_start(self):
+        if not self.profile_enabled:
+            return None
+        _synchronize(self.device)
+        return time.perf_counter()
+
+    def _profile_end(self, phase, start):
+        if start is None:
+            return
+        _synchronize(self.device)
+        self.profile_phases[phase] += time.perf_counter() - start
 
     @classmethod
     def from_darknet(cls, model, n_classes, device=None, loss_mode='darknet'):
@@ -302,7 +317,7 @@ class Yolo_loss(nn.Module):
             raise ValueError('The selected cfg contains no [yolo] detection layers.')
         return cls(specs, n_classes=n_classes, device=device, loss_mode=loss_mode)
 
-    def build_target(self, pred, labels, batchsize, grid_h, grid_w, n_ch, output_id):
+    def build_target_reference(self, pred, labels, batchsize, grid_h, grid_w, n_ch, output_id):
         # target assignment
         spec = self.output_specs[output_id]
         stride = spec['stride']
@@ -380,6 +395,91 @@ class Yolo_loss(nn.Module):
                     tgt_scale[b, a, j, i, :] = torch.sqrt(2 - truth_w_all[b, ti] * truth_h_all[b, ti] / (grid_w * grid_h))
         return obj_mask, tgt_mask, tgt_scale, target
 
+    def build_target(self, pred, labels, batchsize, grid_h, grid_w, n_ch, output_id):
+        """GPU-batched equivalent of ``build_target_reference``.
+
+        This eliminates the per-image Python loops and CPU round trips in the
+        original target assignment while retaining Darknet's anchor matching
+        and ignore-mask rules.
+        """
+        spec = self.output_specs[output_id]
+        stride = spec['stride']
+        all_anchors = torch.as_tensor(spec['anchors'] / stride, device=self.device)
+        n_anchors = len(spec['mask'])
+        tgt_mask = torch.zeros(batchsize, n_anchors, grid_h, grid_w, 4 + self.n_classes, device=self.device)
+        obj_mask = torch.ones(batchsize, n_anchors, grid_h, grid_w, device=self.device)
+        tgt_scale = torch.zeros(batchsize, n_anchors, grid_h, grid_w, 2, device=self.device)
+        target = torch.zeros(batchsize, n_anchors, grid_h, grid_w, n_ch, device=self.device)
+
+        valid = labels.sum(dim=2) > 0
+        truth_x = ((labels[:, :, 2] + labels[:, :, 0]) / (stride * 2)).to(pred.dtype)
+        truth_y = ((labels[:, :, 3] + labels[:, :, 1]) / (stride * 2)).to(pred.dtype)
+        truth_w = ((labels[:, :, 2] - labels[:, :, 0]) / stride).to(pred.dtype)
+        truth_h = ((labels[:, :, 3] - labels[:, :, 1]) / stride).to(pred.dtype)
+        truth_boxes = torch.stack((truth_x, truth_y, truth_w, truth_h), dim=-1)
+
+        # Every prediction whose IoU with any ground truth exceeds
+        # ignore_thresh is excluded from objectness loss, as in Darknet.
+        pred_boxes = pred.reshape(batchsize, -1, 4)
+        pred_tl = pred_boxes[..., :2].unsqueeze(2) - pred_boxes[..., 2:].unsqueeze(2) / 2
+        pred_br = pred_boxes[..., :2].unsqueeze(2) + pred_boxes[..., 2:].unsqueeze(2) / 2
+        truth_tl = truth_boxes[..., :2].unsqueeze(1) - truth_boxes[..., 2:].unsqueeze(1) / 2
+        truth_br = truth_boxes[..., :2].unsqueeze(1) + truth_boxes[..., 2:].unsqueeze(1) / 2
+        intersection_wh = (torch.minimum(pred_br, truth_br) - torch.maximum(pred_tl, truth_tl)).clamp_min(0)
+        intersection = intersection_wh.prod(dim=-1)
+        pred_area = pred_boxes[..., 2:].prod(dim=-1).unsqueeze(2)
+        truth_area = truth_boxes[..., 2:].prod(dim=-1).unsqueeze(1)
+        ious = intersection / (pred_area + truth_area - intersection).clamp_min(1e-16)
+        ious = torch.where(valid.unsqueeze(1), ious, torch.zeros_like(ious))
+        obj_mask = ~(ious.amax(dim=2) > spec['ignore_thresh'])
+        obj_mask = obj_mask.view(batchsize, n_anchors, grid_h, grid_w)
+
+        # Assign each ground truth to its best global anchor, then select the
+        # assignments whose anchor belongs to this output head.
+        truth_wh = truth_boxes[..., 2:]
+        anchor_intersection = torch.minimum(truth_wh.unsqueeze(2), all_anchors.view(1, 1, -1, 2)).prod(dim=-1)
+        anchor_union = truth_wh.prod(dim=-1, keepdim=True) + all_anchors.prod(dim=-1).view(1, 1, -1) - anchor_intersection
+        best_anchor = (anchor_intersection / (anchor_union + 1e-16)).argmax(dim=2)
+        anchor_to_head = torch.full((len(all_anchors),), -1, device=self.device, dtype=torch.long)
+        head_mask = torch.as_tensor(spec['mask'], device=self.device, dtype=torch.long)
+        anchor_to_head[head_mask] = torch.arange(n_anchors, device=self.device)
+        head_anchor = anchor_to_head[best_anchor]
+        positive = valid & (head_anchor >= 0)
+        batch_index, truth_index = positive.nonzero(as_tuple=True)
+        if batch_index.numel() == 0:
+            return obj_mask, tgt_mask, tgt_scale, target
+
+        anchor_index = head_anchor[batch_index, truth_index]
+        grid_x = truth_x[batch_index, truth_index].long().clamp_(0, grid_w - 1)
+        grid_y = truth_y[batch_index, truth_index].long().clamp_(0, grid_h - 1)
+        selected_w = truth_w[batch_index, truth_index]
+        selected_h = truth_h[batch_index, truth_index]
+        scale_x_y = spec['scale_x_y']
+        masked_anchors = all_anchors[head_mask]
+
+        obj_mask[batch_index, anchor_index, grid_y, grid_x] = 1
+        tgt_mask[batch_index, anchor_index, grid_y, grid_x, :] = 1
+        target[batch_index, anchor_index, grid_y, grid_x, 0] = (
+            truth_x[batch_index, truth_index] - torch.floor(truth_x[batch_index, truth_index])
+            + 0.5 * (scale_x_y - 1)
+        ) / scale_x_y
+        target[batch_index, anchor_index, grid_y, grid_x, 1] = (
+            truth_y[batch_index, truth_index] - torch.floor(truth_y[batch_index, truth_index])
+            + 0.5 * (scale_x_y - 1)
+        ) / scale_x_y
+        target[batch_index, anchor_index, grid_y, grid_x, 2] = torch.log(
+            selected_w / masked_anchors[anchor_index, 0] + 1e-16
+        )
+        target[batch_index, anchor_index, grid_y, grid_x, 3] = torch.log(
+            selected_h / masked_anchors[anchor_index, 1] + 1e-16
+        )
+        target[batch_index, anchor_index, grid_y, grid_x, 4] = 1
+        class_index = labels[batch_index, truth_index, 4].long()
+        target[batch_index, anchor_index, grid_y, grid_x, 5 + class_index] = 1
+        scale = torch.sqrt(2 - selected_w * selected_h / (grid_w * grid_h))
+        tgt_scale[batch_index, anchor_index, grid_y, grid_x, :] = scale.unsqueeze(1)
+        return obj_mask, tgt_mask, tgt_scale, target
+
     def forward(self, xin, labels=None):
         # Keep every reported component as a tensor.  Darknet CIoU mode does
         # not use the historical ``loss_wh``/``loss_l2`` terms, but callers
@@ -387,6 +487,7 @@ class Yolo_loss(nn.Module):
         loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = (
             xin[0].new_zeros(()) for _ in range(6)
         )
+        self.profile_phases.clear()
         for output_id, output in enumerate(xin):
             spec = self.output_specs[output_id]
             batchsize = output.shape[0]
@@ -400,6 +501,7 @@ class Yolo_loss(nn.Module):
                     'Update each detection convolution filters value to anchors * (classes + 5).'
                 )
 
+            phase_start = self._profile_start()
             output = output.view(batchsize, n_anchors, n_ch, grid_h, grid_w)
             output = output.permute(0, 1, 3, 4, 2)  # .contiguous()
             box_logits = output[..., :4]
@@ -427,11 +529,15 @@ class Yolo_loss(nn.Module):
                 assignment_pred[..., 1] = assignment_pred[..., 1] * scale_x_y - 0.5 * (scale_x_y - 1) + y
                 assignment_pred[..., 2] = torch.exp(assignment_pred[..., 2]) * anchors[:, 0].view(1, -1, 1, 1)
                 assignment_pred[..., 3] = torch.exp(assignment_pred[..., 3]) * anchors[:, 1].view(1, -1, 1, 1)
+            self._profile_end('loss_prepare_and_assignment_pred_s', phase_start)
 
+            phase_start = self._profile_start()
             obj_mask, tgt_mask, tgt_scale, target = self.build_target(
                 assignment_pred, labels, batchsize, grid_h, grid_w, n_ch, output_id,
             )
+            self._profile_end('loss_target_assignment_s', phase_start)
 
+            phase_start = self._profile_start()
             active_obj = obj_mask.bool()
             positive_cls = target[..., 4].bool()
 
@@ -520,6 +626,7 @@ class Yolo_loss(nn.Module):
                         cls_logits[positive_cls], target[..., 5:][positive_cls], reduction='sum',
                     )
                 loss_l2 += F.mse_loss(input=legacy_output, target=legacy_target, reduction='sum')
+            self._profile_end('loss_objective_and_gradient_s', phase_start)
 
         loss = loss_xy + loss_wh + loss_obj + loss_cls
 
@@ -527,16 +634,26 @@ class Yolo_loss(nn.Module):
 
 
 def collate(batch):
+    collate_start = time.perf_counter()
     images = []
     bboxes = []
-    for img, box in batch:
+    timings = defaultdict(float)
+    has_timings = len(batch[0]) == 3
+    for sample in batch:
+        img, box = sample[:2]
         images.append([img])
         bboxes.append([box])
+        if has_timings:
+            for phase, seconds in sample[2].items():
+                timings[phase] += seconds
     images = np.concatenate(images, axis=0)
     images = images.transpose(0, 3, 1, 2)
     images = torch.from_numpy(images).div(255.0)
     bboxes = np.concatenate(bboxes, axis=0)
     bboxes = torch.from_numpy(bboxes)
+    if has_timings:
+        timings['collate_s'] = time.perf_counter() - collate_start
+        return images, bboxes, dict(timings)
     return images, bboxes
 
 
@@ -607,9 +724,69 @@ class EarlyStopping:
         self.bad_evaluations = int(state.get('bad_evaluations', self.bad_evaluations))
 
 
+class PhaseProfiler:
+    """Opt-in synchronized wall-clock timings for a short training diagnostic."""
+
+    def __init__(self, output_path, warmup_updates, updates):
+        self.output_path = output_path
+        self.warmup_updates = warmup_updates
+        self.updates = updates
+        self.samples = defaultdict(list)
+
+    @property
+    def enabled(self):
+        return self.output_path is not None
+
+    def capture_training(self, optimizer_step):
+        return self.enabled and self.warmup_updates <= optimizer_step < self.warmup_updates + self.updates
+
+    def complete(self, optimizer_step):
+        return self.enabled and optimizer_step >= self.warmup_updates + self.updates
+
+    def record(self, phase, seconds):
+        self.samples[phase].append(seconds)
+
+    def write(self, config):
+        if not self.enabled:
+            return
+        summary = {}
+        for phase, values in self.samples.items():
+            array = np.asarray(values, dtype=np.float64)
+            summary[phase] = {
+                'count': int(array.size),
+                'total_s': float(array.sum()),
+                'mean_s': float(array.mean()),
+                'median_s': float(np.median(array)),
+                'p95_s': float(np.percentile(array, 95)),
+            }
+        payload = {
+            'schema_version': 1,
+            'warmup_updates': self.warmup_updates,
+            'profiled_updates': self.updates,
+            'batch': config.batch,
+            'subdivisions': config.subdivisions,
+            'workers': config.workers,
+            'input_size': [config.width, config.height],
+            'phases': summary,
+        }
+        output_path = os.path.abspath(self.output_path)
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+        logging.info('Wrote phase profile to %s', output_path)
+
+
+def _synchronize(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
 def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5,
           resume_checkpoint=None):
-    train_dataset = Yolo_dataset(config.train_label, config, train=True)
+    train_dataset = Yolo_dataset(
+        config.train_label, config, train=True, profile_data_pipeline=config.profile_data_pipeline,
+    )
     if config.overfit_samples:
         train_dataset = _limit_dataset(train_dataset, config.overfit_samples)
         # Evaluate the exact same images without training augmentation.  This
@@ -645,6 +822,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     global_step = 0
     optimizer_step = 0
     start_epoch = 0
+    profiler = PhaseProfiler(config.profile_output, config.profile_warmup_updates, config.profile_updates)
     early_stopping = EarlyStopping(config.early_stopping_patience, config.early_stopping_min_delta)
     logging.info(f'''Starting training:
         Epochs:          {epochs}
@@ -702,6 +880,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     criterion = Yolo_loss.from_darknet(
         base_model, n_classes=config.classes, device=device, loss_mode=config.loss_mode,
     )
+    criterion.profile_enabled = bool(config.profile_output)
     # scheduler = ReduceLROnPlateau(optimizer, mode='max', verbose=True, patience=6, min_lr=1e-7)
     # scheduler = CosineAnnealingWarmRestarts(optimizer, 0.001, 1e-6, 20)
 
@@ -729,27 +908,73 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         epoch_step = 0
 
         with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img', ncols=50) as pbar:
-            for i, batch in enumerate(train_loader):
+            train_iterator = iter(train_loader)
+            while True:
+                capture_profile = profiler.capture_training(optimizer_step)
+                data_start = time.perf_counter()
+                try:
+                    batch = next(train_iterator)
+                except StopIteration:
+                    break
+                if capture_profile:
+                    profiler.record('train_dataloader_s', time.perf_counter() - data_start)
                 global_step += 1
                 epoch_step += 1
                 images = batch[0]
                 bboxes = batch[1]
+                if capture_profile and len(batch) == 3:
+                    for phase, seconds in batch[2].items():
+                        profiler.record(f'train_dataset_{phase}', seconds)
 
+                if capture_profile:
+                    _synchronize(device)
+                    phase_start = time.perf_counter()
                 images = images.to(device=device, dtype=torch.float32)
                 bboxes = bboxes.to(device=device)
+                if capture_profile:
+                    _synchronize(device)
+                    profiler.record('train_host_to_device_s', time.perf_counter() - phase_start)
 
+                if capture_profile:
+                    _synchronize(device)
+                    phase_start = time.perf_counter()
                 bboxes_pred = model(images)
+                if capture_profile:
+                    _synchronize(device)
+                    profiler.record('train_forward_s', time.perf_counter() - phase_start)
+
+                if capture_profile:
+                    _synchronize(device)
+                    phase_start = time.perf_counter()
                 loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = criterion(bboxes_pred, bboxes)
+                if capture_profile:
+                    _synchronize(device)
+                    profiler.record('train_loss_and_targets_s', time.perf_counter() - phase_start)
+                    for phase, seconds in criterion.profile_phases.items():
+                        profiler.record(f'train_{phase}', seconds)
+
+                if capture_profile:
+                    _synchronize(device)
+                    phase_start = time.perf_counter()
                 # loss = loss / config.subdivisions
                 loss.backward()
+                if capture_profile:
+                    _synchronize(device)
+                    profiler.record('train_backward_s', time.perf_counter() - phase_start)
 
                 epoch_loss += loss.item()
 
                 if global_step % config.subdivisions == 0:
+                    if capture_profile:
+                        _synchronize(device)
+                        phase_start = time.perf_counter()
                     optimizer.step()
                     scheduler.step()
                     model.zero_grad()
                     optimizer_step += 1
+                    if capture_profile:
+                        _synchronize(device)
+                        profiler.record('train_optimizer_s', time.perf_counter() - phase_start)
 
                 if global_step % (log_step * config.subdivisions) == 0:
                     writer.add_scalar('train/Loss', loss.item(), global_step)
@@ -782,7 +1007,8 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                 optimizer_step += 1
 
             is_final_epoch = epoch + 1 == epochs
-            should_evaluate = is_final_epoch or optimizer_step % config.eval_interval == 0
+            profile_complete = profiler.complete(optimizer_step)
+            should_evaluate = is_final_epoch or profile_complete or optimizer_step % config.eval_interval == 0
             stop_early = False
             validation_ap = None
             if should_evaluate:
@@ -797,7 +1023,11 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                     eval_model.load_state_dict(model.state_dict())
                 eval_model.to(device)
                 eval_model.eval()
-                evaluator = evaluate(eval_model, val_loader, config, device)
+                validation_start = time.perf_counter()
+                evaluator = evaluate(eval_model, val_loader, config, device, profiler=profiler if profiler.enabled else None)
+                _synchronize(device)
+                if profiler.enabled:
+                    profiler.record('validation_total_s', time.perf_counter() - validation_start)
                 del eval_model
 
                 stats = evaluator.coco_eval['bbox'].stats
@@ -850,40 +1080,64 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                     except:
                         logging.info(f'failed to remove {model_to_remove}')
 
-            if stop_early:
+            if stop_early or profile_complete:
                 break
 
     writer.close()
+    profiler.write(config)
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, cfg, device, logger=None, **kwargs):
+def evaluate(model, data_loader, cfg, device, logger=None, profiler=None, **kwargs):
     """ finished, tested
     """
     # cpu_device = torch.device("cpu")
     model.eval()
     # header = 'Test:'
 
+    evaluation_start = time.perf_counter()
     coco = convert_to_coco_api(data_loader.dataset, bbox_fmt='coco')
     coco_evaluator = CocoEvaluator(coco, iou_types = ["bbox"], bbox_fmt='coco')
 
-    for images, targets in data_loader:
+    data_iterator = iter(data_loader)
+    while True:
+        data_start = time.perf_counter()
+        try:
+            images, targets = next(data_iterator)
+        except StopIteration:
+            break
+        if profiler:
+            profiler.record('validation_dataloader_s', time.perf_counter() - data_start)
+
+        if profiler:
+            _synchronize(device)
+            phase_start = time.perf_counter()
         model_input = [[cv2.resize(img, (cfg.w, cfg.h))] for img in images]
         model_input = np.concatenate(model_input, axis=0)
         model_input = model_input.transpose(0, 3, 1, 2)
         model_input = torch.from_numpy(model_input).div(255.0)
         model_input = model_input.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        if profiler:
+            _synchronize(device)
+            profiler.record('validation_preprocess_and_host_to_device_s', time.perf_counter() - phase_start)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        model_time = time.time()
-        outputs = model(model_input)
+        if profiler:
+            _synchronize(device)
+            model_time = time.perf_counter()
+            outputs = model(model_input)
+            _synchronize(device)
+            model_time = time.perf_counter() - model_time
+            profiler.record('validation_forward_s', model_time)
+        else:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model_time = time.time()
+            outputs = model(model_input)
+            model_time = time.time() - model_time
 
-        # outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
-        model_time = time.time() - model_time
-
-        # outputs = outputs.cpu().detach().numpy()
+        if profiler:
+            phase_start = time.perf_counter()
         res = {}
         # for img, target, output in zip(images, targets, outputs):
         for img, target, boxes, confs in zip(images, targets, outputs[0], outputs[1]):
@@ -916,16 +1170,25 @@ def evaluate(model, data_loader, cfg, device, logger=None, **kwargs):
                 "scores": scores,
                 "labels": labels,
             }
-        evaluator_time = time.time()
+        if profiler:
+            profiler.record('validation_postprocess_s', time.perf_counter() - phase_start)
+
+        evaluator_time = time.perf_counter()
         coco_evaluator.update(res)
-        evaluator_time = time.time() - evaluator_time
+        evaluator_time = time.perf_counter() - evaluator_time
+        if profiler:
+            profiler.record('validation_coco_update_s', evaluator_time)
 
     # gather the stats from all processes
+    finalize_start = time.perf_counter()
     coco_evaluator.synchronize_between_processes()
 
     # accumulate predictions from all images
     coco_evaluator.accumulate()
     coco_evaluator.summarize()
+    if profiler:
+        profiler.record('validation_coco_finalize_s', time.perf_counter() - finalize_start)
+        profiler.record('validation_evaluate_s', time.perf_counter() - evaluation_start)
 
     return coco_evaluator
 
@@ -963,6 +1226,14 @@ def get_args(**kwargs):
                         help='evaluate every N optimizer updates (and at training end)')
     parser.add_argument('--checkpoint-interval', type=int, default=1000,
                         help='save a checkpoint every N optimizer updates (and at training end)')
+    parser.add_argument('--profile-output', type=str, default=None,
+                        help='write synchronized phase timings to this JSON file and stop after the requested updates')
+    parser.add_argument('--profile-warmup-updates', type=int, default=10,
+                        help='optimizer updates to exclude before recording a phase profile')
+    parser.add_argument('--profile-updates', type=int, default=0,
+                        help='optimizer updates to record when --profile-output is set')
+    parser.add_argument('--profile-data-pipeline', action='store_true',
+                        help='include DataLoader-worker stage timings in an opt-in phase profile')
     parser.add_argument('--cache-images', type=int, choices=[0, 1], default=Cfg.cache_images,
                         help='cache decoded RGB source images before DataLoader workers start')
     parser.add_argument('--early-stopping-patience', type=int, default=Cfg.early_stopping_patience,
@@ -1016,6 +1287,10 @@ def get_args(**kwargs):
         parser.error('--scales must be positive')
     if cfg['eval_interval'] <= 0 or cfg['checkpoint_interval'] <= 0:
         parser.error('--eval-interval and --checkpoint-interval must be positive')
+    if cfg['profile_warmup_updates'] < 0 or cfg['profile_updates'] < 0:
+        parser.error('--profile warmup and update counts must be non-negative')
+    if cfg['profile_output'] and cfg['profile_updates'] == 0:
+        parser.error('--profile-updates must be positive when --profile-output is set')
     if cfg['early_stopping_patience'] < 0:
         parser.error('--early-stopping-patience must be non-negative')
     if cfg['early_stopping_min_delta'] < 0:

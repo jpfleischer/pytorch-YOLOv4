@@ -14,6 +14,8 @@ import os
 import random
 import sys
 import zlib
+import time
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -102,11 +104,12 @@ def rect_intersection(a, b):
 
 
 def image_data_augmentation(mat, w, h, pleft, ptop, swidth, sheight, flip, dhue, dsat, dexp, gaussian_noise, blur,
-                            truth):
+                            truth, timings=None):
     try:
         img = mat
         oh, ow, _ = img.shape
         pleft, ptop, swidth, sheight = int(pleft), int(ptop), int(swidth), int(sheight)
+        resize_start = time.perf_counter() if timings is not None else None
         # crop
         src_rect = [pleft, ptop, swidth + pleft, sheight + ptop]  # x1,y1,x2,y2
         img_rect = [0, 0, ow, oh]
@@ -119,8 +122,11 @@ def image_data_augmentation(mat, w, h, pleft, ptop, swidth, sheight, flip, dhue,
         if src_rect == [0, 0, ow, oh]:
             sized = cv2.resize(img, (w, h), cv2.INTER_LINEAR)
         else:
-            cropped = np.zeros([sheight, swidth, 3])
-            cropped[:, :, ] = np.mean(img, axis=(0, 1))
+            # The colour transform below converts to float32.  Creating this
+            # transient canvas as NumPy's default float64 makes every random
+            # crop substantially more expensive without retaining precision.
+            cropped = np.empty((sheight, swidth, 3), dtype=np.float32)
+            cropped[...] = cv2.mean(img)[:3]
 
             cropped[dst_rect[1]:dst_rect[3], dst_rect[0]:dst_rect[2]] = \
                 img[new_src_rect[1]:new_src_rect[3], new_src_rect[0]:new_src_rect[2]]
@@ -132,10 +138,13 @@ def image_data_augmentation(mat, w, h, pleft, ptop, swidth, sheight, flip, dhue,
         if flip:
             # cv2.Mat cropped
             sized = cv2.flip(sized, 1)  # 0 - x-axis, 1 - y-axis, -1 - both axes (x & y)
+        if timings is not None:
+            timings['resize_and_flip_s'] += time.perf_counter() - resize_start
 
         # HSV augmentation
         # cv2.COLOR_BGR2HSV, cv2.COLOR_RGB2HSV, cv2.COLOR_HSV2BGR, cv2.COLOR_HSV2RGB
         if dsat != 1 or dexp != 1 or dhue != 0:
+            color_start = time.perf_counter() if timings is not None else None
             if img.shape[2] >= 3:
                 hsv_src = cv2.cvtColor(sized.astype(np.float32), cv2.COLOR_RGB2HSV)  # RGB to HSV
                 hsv = list(cv2.split(hsv_src))
@@ -146,6 +155,8 @@ def image_data_augmentation(mat, w, h, pleft, ptop, swidth, sheight, flip, dhue,
                 sized = np.clip(cv2.cvtColor(hsv_src, cv2.COLOR_HSV2RGB), 0, 255)  # HSV to RGB (the same as previous)
             else:
                 sized *= dexp
+            if timings is not None:
+                timings['color_s'] += time.perf_counter() - color_start
 
         if blur:
             if blur == 1:
@@ -240,7 +251,7 @@ def draw_box(img, bboxes):
 
 
 class Yolo_dataset(Dataset):
-    def __init__(self, label_path, cfg, train=True):
+    def __init__(self, label_path, cfg, train=True, profile_data_pipeline=False):
         super(Yolo_dataset, self).__init__()
         if cfg.mixup == 2:
             print("cutmix=1 - isn't supported for Detector")
@@ -251,6 +262,7 @@ class Yolo_dataset(Dataset):
 
         self.cfg = cfg
         self.train = train
+        self.profile_data_pipeline = profile_data_pipeline
 
         truth = {}
         with open(label_path, 'r', encoding='utf-8') as f:
@@ -296,6 +308,8 @@ class Yolo_dataset(Dataset):
     def __getitem__(self, index):
         if not self.train:
             return self._get_val_item(index)
+        sample_start = time.perf_counter() if self.profile_data_pipeline else None
+        timings = {'image_load_s': 0.0, 'target_transform_s': 0.0, 'augmentation_s': 0.0}
         img_path = self.imgs[index]
         bboxes = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
         use_mixup = self.cfg.mixup
@@ -318,7 +332,10 @@ class Yolo_dataset(Dataset):
             if i != 0:
                 img_path = random.choice(list(self.truth.keys()))
                 bboxes = np.asarray(self.truth.get(img_path), dtype=np.float32).reshape(-1, 5)
+            phase_start = time.perf_counter() if self.profile_data_pipeline else None
             img = self._load_image(img_path)
+            if self.profile_data_pipeline:
+                timings['image_load_s'] += time.perf_counter() - phase_start
             oh, ow, oc = img.shape
             dh, dw, dc = np.array(np.array([oh, ow, oc]) * self.cfg.jitter, dtype=np.int32)
 
@@ -368,13 +385,26 @@ class Yolo_dataset(Dataset):
             swidth = ow - pleft - pright
             sheight = oh - ptop - pbot
 
+            phase_start = time.perf_counter() if self.profile_data_pipeline else None
             truth, min_w_h = fill_truth_detection(bboxes, self.cfg.boxes, self.cfg.classes, flip, pleft, ptop, swidth,
                                                   sheight, self.cfg.w, self.cfg.h)
+            if self.profile_data_pipeline:
+                timings['target_transform_s'] += time.perf_counter() - phase_start
             if (min_w_h / 8) < blur and blur > 1:  # disable blur if one of the objects is too small
                 blur = min_w_h / 8
 
+            phase_start = time.perf_counter() if self.profile_data_pipeline else None
+            augmentation_timings = defaultdict(float) if self.profile_data_pipeline else None
             ai = image_data_augmentation(img, self.cfg.w, self.cfg.h, pleft, ptop, swidth, sheight, flip,
-                                         dhue, dsat, dexp, gaussian_noise, blur, truth)
+                                         dhue, dsat, dexp, gaussian_noise, blur, truth, timings=augmentation_timings)
+            if self.profile_data_pipeline:
+                timings['augmentation_s'] += time.perf_counter() - phase_start
+                timings['augmentation_resize_and_flip_s'] = (
+                    timings.get('augmentation_resize_and_flip_s', 0.0) + augmentation_timings['resize_and_flip_s']
+                )
+                timings['augmentation_color_s'] = (
+                    timings.get('augmentation_color_s', 0.0) + augmentation_timings['color_s']
+                )
 
             if use_mixup == 0:
                 out_img = ai
@@ -406,6 +436,11 @@ class Yolo_dataset(Dataset):
             out_bboxes = np.concatenate(out_bboxes, axis=0)
         out_bboxes1 = np.zeros([self.cfg.boxes, 5])
         out_bboxes1[:min(out_bboxes.shape[0], self.cfg.boxes)] = out_bboxes[:min(out_bboxes.shape[0], self.cfg.boxes)]
+        if self.profile_data_pipeline:
+            timings['other_s'] = time.perf_counter() - sample_start - (
+                timings['image_load_s'] + timings['target_transform_s'] + timings['augmentation_s']
+            )
+            return out_img, out_bboxes1, timings
         return out_img, out_bboxes1
 
     def _get_val_item(self, index):
